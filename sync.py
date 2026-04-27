@@ -46,18 +46,22 @@ def ensure_clone() -> None:
     if (GSD_DIR / ".git").exists():
         return
     url = _authed_url()
-    # If GSD_DIR has files but isn't a git repo, wipe and reclone for cleanliness
-    if any(GSD_DIR.iterdir()):
-        print(f"[sync] {GSD_DIR} has stale files — wiping and re-cloning")
-        for child in GSD_DIR.iterdir():
-            if child.is_dir():
-                subprocess.run(["rm", "-rf", str(child)], check=False)
-            else:
-                child.unlink()
-    print(f"[sync] cloning {BRANCH} branch into {GSD_DIR}")
-    _run(["git", "clone", "-b", BRANCH, url, "."], cwd=GSD_DIR)
+    # Init in place rather than clone, since GSD_DIR may be a volume mount we can't delete
+    print(f"[sync] init+pulling {BRANCH} into {GSD_DIR}")
+    _run(["git", "init"])
     _run(["git", "config", "user.email", "bot@gsd.local"])
     _run(["git", "config", "user.name", "GSD Bot"])
+    # If origin already exists, set-url; otherwise add
+    existing = _run(["git", "remote"], check=False).stdout
+    if "origin" in existing.split():
+        _run(["git", "remote", "set-url", "origin", url])
+    else:
+        _run(["git", "remote", "add", "origin", url])
+    _run(["git", "fetch", "origin", BRANCH])
+    # Reset to remote, throwing away any stale local files
+    _run(["git", "checkout", "-B", BRANCH, f"origin/{BRANCH}"])
+    _run(["git", "reset", "--hard", f"origin/{BRANCH}"], check=False)
+    _run(["git", "clean", "-fd"], check=False)
 
 
 def pull() -> None:
