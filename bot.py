@@ -6,7 +6,10 @@ from discord.ext import tasks
 from dotenv import load_dotenv
 from datetime import date, time
 from zoneinfo import ZoneInfo
+import sync
 import gsd
+
+sync.ensure_clone()
 
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")

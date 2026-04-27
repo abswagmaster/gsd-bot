@@ -3,6 +3,7 @@ import os
 from pathlib import Path
 from datetime import date, timedelta
 import re
+import sync
 
 # Allow override via env var (e.g. Railway volume mount). Defaults to ~/.gsd locally.
 GSD_DIR = Path(os.getenv("GSD_DIR", str(Path.home() / ".gsd")))
@@ -81,10 +82,12 @@ def _carry_forward(person: str) -> dict:
 
 
 def read_tasks(person: str) -> dict:
+    sync.pull()
     path = get_today_path(person)
     if not path.exists() or not path.read_text().strip():
         sections = _carry_forward(person)
         path.write_text(_serialize(sections))
+        sync.push(f"{person}: create today")
         return sections
     return _parse(path.read_text())
 
@@ -103,6 +106,7 @@ def add_task(person: str, text: str, section: str) -> None:
     sections = read_tasks(person)
     sections[section].append(f"- [ ] {text}")
     get_today_path(person).write_text(_serialize(sections))
+    sync.push(f"{person}: add {section}")
 
 
 def toggle_task(person: str, n: int, done: bool) -> tuple[str, str] | None:
@@ -117,6 +121,7 @@ def toggle_task(person: str, n: int, done: bool) -> tuple[str, str] | None:
         new_line = re.sub(r"- \[x\]", "- [ ]", line, count=1, flags=re.IGNORECASE)
     sections[key][idx] = new_line
     get_today_path(person).write_text(_serialize(sections))
+    sync.push(f"{person}: toggle task #{n}")
     task_text = re.sub(r"\s*- \[.\]\s*", "", new_line).strip()
     return key, task_text
 
@@ -129,4 +134,5 @@ def clear_done(person: str) -> int:
         sections[key] = [l for l in sections[key] if not re.match(r"\s*- \[x\]", l, re.IGNORECASE)]
         count += before - len(sections[key])
     get_today_path(person).write_text(_serialize(sections))
+    sync.push(f"{person}: clear done")
     return count
