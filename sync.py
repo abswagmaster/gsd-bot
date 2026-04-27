@@ -46,16 +46,16 @@ def ensure_clone() -> None:
     if (GSD_DIR / ".git").exists():
         return
     url = _authed_url()
-    # If GSD_DIR has files but isn't a git repo, init and pull
+    # If GSD_DIR has files but isn't a git repo, wipe and reclone for cleanliness
     if any(GSD_DIR.iterdir()):
-        print(f"[sync] {GSD_DIR} has files but no .git — initializing")
-        _run(["git", "init"])
-        _run(["git", "remote", "add", "origin", url])
-        _run(["git", "fetch", "origin", BRANCH])
-        _run(["git", "checkout", "-b", BRANCH, f"origin/{BRANCH}"])
-    else:
-        print(f"[sync] cloning {BRANCH} branch into {GSD_DIR}")
-        _run(["git", "clone", "-b", BRANCH, url, "."], cwd=GSD_DIR)
+        print(f"[sync] {GSD_DIR} has stale files — wiping and re-cloning")
+        for child in GSD_DIR.iterdir():
+            if child.is_dir():
+                subprocess.run(["rm", "-rf", str(child)], check=False)
+            else:
+                child.unlink()
+    print(f"[sync] cloning {BRANCH} branch into {GSD_DIR}")
+    _run(["git", "clone", "-b", BRANCH, url, "."], cwd=GSD_DIR)
     _run(["git", "config", "user.email", "bot@gsd.local"])
     _run(["git", "config", "user.name", "GSD Bot"])
 
