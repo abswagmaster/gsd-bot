@@ -92,8 +92,21 @@ async def on_ready():
     print(f"Logged in as {client.user} — synced to guild, reminder loop started")
 
 
-@tree.command(name="list", description="Show today's tasks for everyone")
+def _build_one_list_embed(person: str) -> discord.Embed:
+    sections = gsd.read_tasks(person)
+    embed = _person_embed(person, sections, PERSON_COLORS[0])
+    embed.title = f"📋 {date.today().isoformat()} — {embed.title}"
+    return embed
+
+
+@tree.command(name="list", description="Show your own tasks for today")
 async def cmd_list(interaction: discord.Interaction):
+    person = _person_name(interaction)
+    await interaction.response.send_message(embed=_build_one_list_embed(person))
+
+
+@tree.command(name="listboth", description="Show today's tasks for both people")
+async def cmd_listboth(interaction: discord.Interaction):
     embeds = _build_all_lists_embeds()
     if not embeds:
         await interaction.response.send_message("No tasks yet. Use `/nosleep` or `/effort` to add some.", ephemeral=True)
