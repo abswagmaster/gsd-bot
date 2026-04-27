@@ -63,7 +63,7 @@ def _build_all_lists_embeds() -> list[discord.Embed]:
     return embeds
 
 
-@tasks.loop(time=[time(10, 0, tzinfo=LOCAL_TZ), time(22, 0, tzinfo=LOCAL_TZ)])
+@tasks.loop(time=[time(10, 0, tzinfo=LOCAL_TZ), time(23, 0, tzinfo=LOCAL_TZ)])
 async def daily_reminder():
     channel = client.get_channel(REMINDER_CHANNEL_ID)
     if channel is None:
