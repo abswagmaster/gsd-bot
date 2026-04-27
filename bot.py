@@ -119,6 +119,22 @@ async def cmd_listboth(interaction: discord.Interaction):
     await interaction.followup.send(embeds=embeds)
 
 
+def _numbered_added(person: str, count: int, section: str) -> list[tuple[int, str]]:
+    """After adding `count` items to `section`, return their (number, text) pairs.
+
+    Numbers match what /list shows (no_sleep numbered first, then best_effort)."""
+    sections = gsd.read_tasks(person)
+    all_t = gsd.all_tasks(sections)
+    # Find the indices of items in the target section, then take the last `count`
+    target = [(i, line) for i, (k, _, line) in enumerate(all_t) if k == section]
+    last = target[-count:] if count <= len(target) else target
+    out = []
+    for idx, line in last:
+        text = re.sub(r"\s*- \[.\]\s*", "", line).strip()
+        out.append((idx + 1, text))  # idx+1 since /list uses 1-based numbering
+    return out
+
+
 @tree.command(name="nosleep", description="Add one or more tasks to your No Sleep list (separate with commas)")
 @app_commands.describe(tasks="e.g. finish report, call Alex, review PR")
 async def cmd_nosleep(interaction: discord.Interaction, tasks: str):
@@ -127,7 +143,8 @@ async def cmd_nosleep(interaction: discord.Interaction, tasks: str):
     items = [t.strip() for t in tasks.split(",") if t.strip()]
     for item in items:
         gsd.add_task(person, item, "no_sleep")
-    lines = "\n".join(f"☐ {item}" for item in items)
+    numbered = _numbered_added(person, len(items), "no_sleep")
+    lines = "\n".join(f"`{n}.` ☐ {text}" for n, text in numbered)
     embed = discord.Embed(
         description=f"🔥 **No Sleep** added for **{person}**\n{lines}",
         color=discord.Color.red()
@@ -143,7 +160,8 @@ async def cmd_effort(interaction: discord.Interaction, tasks: str):
     items = [t.strip() for t in tasks.split(",") if t.strip()]
     for item in items:
         gsd.add_task(person, item, "best_effort")
-    lines = "\n".join(f"☐ {item}" for item in items)
+    numbered = _numbered_added(person, len(items), "best_effort")
+    lines = "\n".join(f"`{n}.` ☐ {text}" for n, text in numbered)
     embed = discord.Embed(
         description=f"⚡ **Best Effort** added for **{person}**\n{lines}",
         color=discord.Color.yellow()
