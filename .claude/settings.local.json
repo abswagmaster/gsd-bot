@@ -1,0 +1,18 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pip install *)",
+      "Bash(pip3 install *)",
+      "Bash(python3 bot.py)",
+      "Read(//Users/abswag/.gsd/**)",
+      "Read(//Users/abswag/.gsd/AB/**)",
+      "Bash(python3 -c ' *)",
+      "Bash(pkill -9 -f \"Python.*bot.py\")",
+      "Bash(gh auth *)",
+      "Bash(git init *)",
+      "Bash(git add *)",
+      "Bash(git rm *)",
+      "Bash(git commit *)"
+    ]
+  }
+}
