@@ -104,22 +104,25 @@ def _build_one_list_embed(person: str) -> discord.Embed:
 
 @tree.command(name="list", description="Show your own tasks for today")
 async def cmd_list(interaction: discord.Interaction):
+    await interaction.response.defer()
     person = _person_name(interaction)
-    await interaction.response.send_message(embed=_build_one_list_embed(person))
+    await interaction.followup.send(embed=_build_one_list_embed(person))
 
 
 @tree.command(name="listboth", description="Show today's tasks for both people")
 async def cmd_listboth(interaction: discord.Interaction):
+    await interaction.response.defer()
     embeds = _build_all_lists_embeds()
     if not embeds:
-        await interaction.response.send_message("No tasks yet. Use `/nosleep` or `/effort` to add some.", ephemeral=True)
+        await interaction.followup.send("No tasks yet. Use `/nosleep` or `/effort` to add some.", ephemeral=True)
         return
-    await interaction.response.send_message(embeds=embeds)
+    await interaction.followup.send(embeds=embeds)
 
 
 @tree.command(name="nosleep", description="Add one or more tasks to your No Sleep list (separate with commas)")
 @app_commands.describe(tasks="e.g. finish report, call Alex, review PR")
 async def cmd_nosleep(interaction: discord.Interaction, tasks: str):
+    await interaction.response.defer()
     person = _person_name(interaction)
     items = [t.strip() for t in tasks.split(",") if t.strip()]
     for item in items:
@@ -129,12 +132,13 @@ async def cmd_nosleep(interaction: discord.Interaction, tasks: str):
         description=f"🔥 **No Sleep** added for **{person}**\n{lines}",
         color=discord.Color.red()
     )
-    await interaction.response.send_message(embed=embed)
+    await interaction.followup.send(embed=embed)
 
 
 @tree.command(name="effort", description="Add one or more tasks to your Best Effort list (separate with commas)")
 @app_commands.describe(tasks="e.g. clean inbox, update docs, review metrics")
 async def cmd_effort(interaction: discord.Interaction, tasks: str):
+    await interaction.response.defer()
     person = _person_name(interaction)
     items = [t.strip() for t in tasks.split(",") if t.strip()]
     for item in items:
@@ -144,7 +148,7 @@ async def cmd_effort(interaction: discord.Interaction, tasks: str):
         description=f"⚡ **Best Effort** added for **{person}**\n{lines}",
         color=discord.Color.yellow()
     )
-    await interaction.response.send_message(embed=embed)
+    await interaction.followup.send(embed=embed)
 
 
 def _parse_numbers(s: str) -> list[int]:
@@ -161,10 +165,11 @@ def _parse_numbers(s: str) -> list[int]:
 @tree.command(name="done", description="Mark one or more of your tasks as complete")
 @app_commands.describe(numbers="Task number(s), e.g. 1 or 1,2,3")
 async def cmd_done(interaction: discord.Interaction, numbers: str):
+    await interaction.response.defer()
     person = _person_name(interaction)
     nums = _parse_numbers(numbers)
     if not nums:
-        await interaction.response.send_message("No valid task numbers given.", ephemeral=True)
+        await interaction.followup.send("No valid task numbers given.", ephemeral=True)
         return
     completed: list[tuple[str, str]] = []
     missing: list[int] = []
@@ -185,16 +190,17 @@ async def cmd_done(interaction: discord.Interaction, numbers: str):
         description="\n".join(lines) if lines else "Nothing to do.",
         color=discord.Color.green()
     )
-    await interaction.response.send_message(embed=embed)
+    await interaction.followup.send(embed=embed)
 
 
 @tree.command(name="undone", description="Reopen one or more of your completed tasks")
 @app_commands.describe(numbers="Task number(s), e.g. 1 or 1,2,3")
 async def cmd_undone(interaction: discord.Interaction, numbers: str):
+    await interaction.response.defer()
     person = _person_name(interaction)
     nums = _parse_numbers(numbers)
     if not nums:
-        await interaction.response.send_message("No valid task numbers given.", ephemeral=True)
+        await interaction.followup.send("No valid task numbers given.", ephemeral=True)
         return
     reopened: list[tuple[str, str]] = []
     missing: list[int] = []
@@ -215,18 +221,19 @@ async def cmd_undone(interaction: discord.Interaction, numbers: str):
         description="\n".join(lines) if lines else "Nothing to do.",
         color=discord.Color.orange()
     )
-    await interaction.response.send_message(embed=embed)
+    await interaction.followup.send(embed=embed)
 
 
 @tree.command(name="clear", description="Remove all your completed tasks")
 async def cmd_clear(interaction: discord.Interaction):
+    await interaction.response.defer()
     person = _person_name(interaction)
     count = gsd.clear_done(person)
     embed = discord.Embed(
         description=f"Cleared **{count}** completed task(s) for **{person}**.",
         color=discord.Color.greyple()
     )
-    await interaction.response.send_message(embed=embed)
+    await interaction.followup.send(embed=embed)
 
 
 client.run(TOKEN)
