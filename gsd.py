@@ -1,16 +1,27 @@
 from __future__ import annotations
 import os
 from pathlib import Path
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
+import zoneinfo
 import re
 import sync
 
 # Allow override via env var (e.g. Railway volume mount). Defaults to ~/.gsd locally.
 GSD_DIR = Path(os.getenv("GSD_DIR", str(Path.home() / ".gsd")))
 
+_LOCAL_TZ = zoneinfo.ZoneInfo(os.getenv("TZ", "America/New_York"))
+_DAY_START_HOUR = 4  # new day begins at 4 AM local time
+
+
+def _logical_today() -> date:
+    now = datetime.now(tz=_LOCAL_TZ)
+    if now.hour < _DAY_START_HOUR:
+        return (now - timedelta(days=1)).date()
+    return now.date()
+
 
 def get_today_path(person: str) -> Path:
-    today = date.today().isoformat()
+    today = _logical_today().isoformat()
     path = GSD_DIR / person / f"{today}.md"
     path.parent.mkdir(parents=True, exist_ok=True)
     return path
@@ -30,7 +41,7 @@ def list_people() -> list[str]:
 
 def _find_recent_path(person: str) -> Path | None:
     for days_back in range(1, 31):
-        d = (date.today() - timedelta(days=days_back)).isoformat()
+        d = (_logical_today() - timedelta(days=days_back)).isoformat()
         p = GSD_DIR / person / f"{d}.md"
         if p.exists() and p.read_text().strip():
             return p
