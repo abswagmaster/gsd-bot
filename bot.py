@@ -31,10 +31,12 @@ def _fmt_section(lines: list[str], label: str, emoji: str, start_n: int) -> str:
     n = start_n
     for line in lines:
         if re.match(r"\s*- \[.\]", line):
-            text = re.sub(r"\s*- \[.\]\s*", "", line).strip()
             done = bool(re.match(r"\s*- \[x\]", line, re.IGNORECASE))
-            checkbox = "☑" if done else "☐"
-            rows.append(f"`{n}.` {checkbox} {text}")
+            if done:
+                n += 1
+                continue
+            text = re.sub(r"\s*- \[.\]\s*", "", line).strip()
+            rows.append(f"`{n}.` ☐ {text}")
             n += 1
     if not rows:
         return f"**{emoji} {label}**\n*nothing here*"
