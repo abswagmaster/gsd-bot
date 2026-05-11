@@ -6,11 +6,11 @@ import zoneinfo
 import re
 import sync
 
-# Allow override via env var (e.g. Railway volume mount). Defaults to ~/.gsd locally.
 GSD_DIR = Path(os.getenv("GSD_DIR", str(Path.home() / ".gsd")))
+NOTEBOOK = "Daily"  # shared notebook folder inside ~/.gsd/
 
 _LOCAL_TZ = zoneinfo.ZoneInfo(os.getenv("TZ", "America/New_York"))
-_DAY_START_HOUR = 4  # new day begins at 4 AM local time
+_DAY_START_HOUR = 4  # new day begins at 4 AM
 
 
 def _logical_today() -> date:
@@ -20,50 +20,51 @@ def _logical_today() -> date:
     return now.date()
 
 
-def get_today_path(person: str) -> Path:
+def get_today_path() -> Path:
     today = _logical_today().isoformat()
-    path = GSD_DIR / person / f"{today}.md"
+    path = GSD_DIR / NOTEBOOK / f"{today}.md"
     path.parent.mkdir(parents=True, exist_ok=True)
     return path
 
 
-_SYSTEM_NOTEBOOKS = {"Daily", "daily", "Work", "Personal"}
-
-def list_people() -> list[str]:
-    """Return all person notebooks, excluding built-in GSD notebook names."""
-    if not GSD_DIR.exists():
-        return []
-    return sorted(
-        p.name for p in GSD_DIR.iterdir()
-        if p.is_dir() and p.name not in _SYSTEM_NOTEBOOKS and any(p.glob("*.md"))
-    )
-
-
-def _find_recent_path(person: str) -> Path | None:
+def _find_recent_path() -> Path | None:
     for days_back in range(1, 31):
         d = (_logical_today() - timedelta(days=days_back)).isoformat()
-        p = GSD_DIR / person / f"{d}.md"
+        p = GSD_DIR / NOTEBOOK / f"{d}.md"
         if p.exists() and p.read_text().strip():
             return p
     return None
 
 
+# Section keys
+SECTIONS = ["ayush_no_sleep", "ayush_best_effort", "rohit_no_sleep", "rohit_best_effort"]
+
+_HEADERS = {
+    "ayush": "## Ayush",
+    "rohit": "## Rohit",
+    "no_sleep": "### No Sleep",
+    "best_effort": "### Best Effort",
+}
+
+
 def _parse(text: str) -> dict:
-    sections: dict[str, list[str]] = {"no_sleep": [], "best_effort": []}
-    current = None
+    sections: dict[str, list[str]] = {k: [] for k in SECTIONS}
+    person = None
+    section = None
     for line in text.splitlines():
         stripped = line.strip()
-        if stripped == "## No Sleep":
-            current = "no_sleep"
-            continue
-        if stripped == "## Best Effort":
-            current = "best_effort"
-            continue
-        if stripped.startswith("## "):
-            current = None
-            continue
-        if current is not None:
-            sections[current].append(line)
+        if stripped == "## Ayush":
+            person, section = "ayush", None
+        elif stripped == "## Rohit":
+            person, section = "rohit", None
+        elif stripped == "### No Sleep":
+            section = "no_sleep"
+        elif stripped == "### Best Effort":
+            section = "best_effort"
+        elif stripped.startswith("## ") or stripped.startswith("### "):
+            section = None
+        elif person and section:
+            sections[f"{person}_{section}"].append(line)
     for k in sections:
         while sections[k] and not sections[k][-1].strip():
             sections[k].pop()
@@ -72,41 +73,42 @@ def _parse(text: str) -> dict:
 
 def _serialize(sections: dict) -> str:
     parts = []
-    parts.append("## No Sleep")
-    parts.extend(sections.get("no_sleep", []))
-    parts.append("")
-    parts.append("## Best Effort")
-    parts.extend(sections.get("best_effort", []))
-    parts.append("")
+    for person in ("ayush", "rohit"):
+        parts.append(f"## {person.capitalize()}")
+        parts.append("")
+        for sec, label in (("no_sleep", "No Sleep"), ("best_effort", "Best Effort")):
+            parts.append(f"### {label}")
+            parts.extend(sections.get(f"{person}_{sec}", []))
+            parts.append("")
     return "\n".join(parts)
 
 
-def _carry_forward(person: str) -> dict:
-    recent = _find_recent_path(person)
+def _carry_forward() -> dict:
+    recent = _find_recent_path()
     if not recent:
-        return {"no_sleep": [], "best_effort": []}
+        return {k: [] for k in SECTIONS}
     prev = _parse(recent.read_text())
     return {
-        "no_sleep": [l for l in prev["no_sleep"] if re.match(r"\s*- \[ \]", l)],
-        "best_effort": [l for l in prev["best_effort"] if re.match(r"\s*- \[ \]", l)],
+        k: [l for l in prev[k] if re.match(r"\s*- \[ \]", l)]
+        for k in SECTIONS
     }
 
 
-def read_tasks(person: str) -> dict:
+def read_tasks() -> dict:
     sync.pull()
-    path = get_today_path(person)
+    path = get_today_path()
     if not path.exists() or not path.read_text().strip():
-        sections = _carry_forward(person)
+        sections = _carry_forward()
         path.write_text(_serialize(sections))
-        sync.push(f"{person}: create today")
+        sync.push("create today")
         return sections
     return _parse(path.read_text())
 
 
 def all_tasks(sections: dict) -> list[tuple[str, int, str]]:
-    """(section_key, line_index, line) for every checkbox line, No Sleep first."""
+    """(section_key, line_index, line) for every checkbox line."""
     tasks = []
-    for key in ("no_sleep", "best_effort"):
+    for key in SECTIONS:
         for i, line in enumerate(sections[key]):
             if re.match(r"\s*- \[.\]", line):
                 tasks.append((key, i, line))
@@ -114,14 +116,16 @@ def all_tasks(sections: dict) -> list[tuple[str, int, str]]:
 
 
 def add_task(person: str, text: str, section: str) -> None:
-    sections = read_tasks(person)
-    sections[section].append(f"- [ ] {text}")
-    get_today_path(person).write_text(_serialize(sections))
-    sync.push(f"{person}: add {section}")
+    """person: 'ayush' or 'rohit'. section: 'no_sleep' or 'best_effort'."""
+    sections = read_tasks()
+    key = f"{person}_{section}"
+    sections[key].append(f"- [ ] {text}")
+    get_today_path().write_text(_serialize(sections))
+    sync.push(f"{person}: add task")
 
 
-def toggle_task(person: str, n: int, done: bool) -> tuple[str, str] | None:
-    sections = read_tasks(person)
+def toggle_task(n: int, done: bool) -> tuple[str, str] | None:
+    sections = read_tasks()
     tasks = all_tasks(sections)
     if n < 1 or n > len(tasks):
         return None
@@ -131,19 +135,7 @@ def toggle_task(person: str, n: int, done: bool) -> tuple[str, str] | None:
     else:
         new_line = re.sub(r"- \[x\]", "- [ ]", line, count=1, flags=re.IGNORECASE)
     sections[key][idx] = new_line
-    get_today_path(person).write_text(_serialize(sections))
-    sync.push(f"{person}: toggle task #{n}")
+    get_today_path().write_text(_serialize(sections))
+    sync.push(f"toggle task #{n}")
     task_text = re.sub(r"\s*- \[.\]\s*", "", new_line).strip()
     return key, task_text
-
-
-def clear_done(person: str) -> int:
-    sections = read_tasks(person)
-    count = 0
-    for key in ("no_sleep", "best_effort"):
-        before = len(sections[key])
-        sections[key] = [l for l in sections[key] if not re.match(r"\s*- \[x\]", l, re.IGNORECASE)]
-        count += before - len(sections[key])
-    get_today_path(person).write_text(_serialize(sections))
-    sync.push(f"{person}: clear done")
-    return count
