@@ -17,6 +17,11 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# Import gsd so we can create today's file with carry-forward
+import sys
+sys.path.insert(0, str(Path(__file__).parent))
+import gsd
+
 GSD_DIR = Path(os.getenv("GSD_DIR", str(Path.home() / ".gsd")))
 REPO_URL = os.getenv("GIT_REPO_URL", "")
 BRANCH = os.getenv("GIT_BRANCH", "data")
@@ -80,18 +85,40 @@ def ensure_setup() -> bool:
     return True
 
 
+def ensure_today() -> None:
+    """Create today's file with carried-forward tasks if it doesn't exist yet."""
+    path = gsd.get_today_path()
+    if not path.exists() or not path.read_text().strip():
+        sections = gsd._carry_forward()
+        path.write_text(gsd._serialize(sections))
+        push("create today with carry-forward")
+        print(f"[gsd] created {path.name} with carry-forward")
+
+
 def run() -> None:
     if not ensure_setup():
         return
 
+    # Always ensure today's file exists on startup
+    ensure_today()
+
     print(f"[sync] watching {GSD_DIR} — pull every {PULL_INTERVAL_SEC}s, push on change")
     last_pull = 0.0
     last_change_time: float | None = None
+    last_date = gsd._logical_today()
     prev_snap = snapshot()
 
     while True:
         time.sleep(1)
         now = time.time()
+
+        # Check if the logical day has rolled over (4 AM boundary)
+        today = gsd._logical_today()
+        if today != last_date:
+            last_date = today
+            pull()
+            ensure_today()
+            prev_snap = snapshot()
 
         # Detect local file changes
         curr_snap = snapshot()
