@@ -85,40 +85,94 @@ def ensure_setup() -> bool:
     return True
 
 
-def ensure_today() -> None:
-    """Create today's file with carried-forward tasks if it doesn't exist yet,
-    or migrate it to the Ayush/Rohit format if it has the wrong structure.
-    Pulls first so we don't duplicate work if the other machine already created it."""
-    pull()
-    path = gsd.get_today_path()
-    if not path.exists() or not path.read_text().strip():
-        sections = gsd._carry_forward()
-        path.write_text(gsd._serialize(sections))
-        push("create today with carry-forward")
-        print(f"[gsd] created {path.name} with carry-forward")
-        return
+import re as _re
+from datetime import timedelta as _td
 
-    # File exists — check if it has the right structure.
+
+def _blank_sections() -> dict:
+    return {k: [] for k in gsd.SECTIONS}
+
+
+def _migrate_file(path) -> bool:
+    """If file has the wrong format, rewrite as Ayush/Rohit with existing tasks
+    placed under Ayush's No Sleep. Returns True if anything changed."""
+    if not path.exists():
+        return False
     text = path.read_text()
+    if not text.strip():
+        path.write_text(gsd._serialize(_blank_sections()))
+        return True
     if "## Ayush" in text and "## Rohit" in text:
-        return  # already correct
-
-    # Wrong format — migrate. Preserve any existing tasks under Ayush's No Sleep.
-    import re
-    sections = gsd._carry_forward()
+        return False
+    sections = _blank_sections()
     for line in text.splitlines():
-        if re.match(r"\s*- \[.\]", line):
+        if _re.match(r"\s*- \[.\]", line):
             sections["ayush_no_sleep"].append(line)
     path.write_text(gsd._serialize(sections))
-    push("migrate today's file to Ayush/Rohit format")
-    print(f"[gsd] migrated {path.name} to correct format")
+    return True
+
+
+def migrate_all_daily_files() -> None:
+    """Ensure every file in Daily/ has the Ayush/Rohit structure."""
+    daily_dir = gsd.GSD_DIR / gsd.NOTEBOOK
+    if not daily_dir.exists():
+        return
+    changed = False
+    for path in daily_dir.glob("*.md"):
+        if _migrate_file(path):
+            changed = True
+            print(f"[gsd] migrated {path.name}")
+    if changed:
+        push("migrate daily files to Ayush/Rohit format")
+
+
+def ensure_today() -> None:
+    """Pull, then ensure today's file exists in the right format AND
+    merge yesterday's unchecked tasks into today (4 AM carry-forward).
+    Safe to run repeatedly — duplicates are skipped."""
+    pull()
+    today = gsd._logical_today()
+    yesterday = today - _td(days=1)
+    today_path = gsd.GSD_DIR / gsd.NOTEBOOK / f"{today.isoformat()}.md"
+    yest_path = gsd.GSD_DIR / gsd.NOTEBOOK / f"{yesterday.isoformat()}.md"
+    today_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Ensure today's file exists in correct format
+    if not today_path.exists() or not today_path.read_text().strip():
+        today_path.write_text(gsd._serialize(_blank_sections()))
+        print(f"[gsd] created blank {today_path.name}")
+    else:
+        if _migrate_file(today_path):
+            print(f"[gsd] migrated {today_path.name}")
+
+    # Merge yesterday's unchecked into today (skip if no yesterday file)
+    if not yest_path.exists():
+        push("ensure today")
+        return
+    _migrate_file(yest_path)  # ensure yesterday is in correct format too
+    yest_sections = gsd._parse(yest_path.read_text())
+    today_sections = gsd._parse(today_path.read_text())
+
+    added = 0
+    for k in gsd.SECTIONS:
+        existing = set(l.strip() for l in today_sections[k])
+        for l in yest_sections[k]:
+            if _re.match(r"\s*- \[ \]", l) and l.strip() not in existing:
+                today_sections[k].append(l)
+                existing.add(l.strip())
+                added += 1
+    if added:
+        today_path.write_text(gsd._serialize(today_sections))
+        print(f"[gsd] carried forward {added} unchecked tasks from {yest_path.name}")
+    push("ensure today")
 
 
 def run() -> None:
     if not ensure_setup():
         return
 
-    # Always ensure today's file exists on startup
+    # Migrate any existing files to the correct format, then ensure today
+    migrate_all_daily_files()
     ensure_today()
 
     print(f"[sync] watching {GSD_DIR} — pull every {PULL_INTERVAL_SEC}s, push on change")
