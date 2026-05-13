@@ -86,7 +86,9 @@ def ensure_setup() -> bool:
 
 
 def ensure_today() -> None:
-    """Create today's file with carried-forward tasks if it doesn't exist yet."""
+    """Create today's file with carried-forward tasks if it doesn't exist yet.
+    Pulls first so we don't duplicate work if the other machine already created it."""
+    pull()
     path = gsd.get_today_path()
     if not path.exists() or not path.read_text().strip():
         sections = gsd._carry_forward()
