@@ -86,7 +86,8 @@ def ensure_setup() -> bool:
 
 
 def ensure_today() -> None:
-    """Create today's file with carried-forward tasks if it doesn't exist yet.
+    """Create today's file with carried-forward tasks if it doesn't exist yet,
+    or migrate it to the Ayush/Rohit format if it has the wrong structure.
     Pulls first so we don't duplicate work if the other machine already created it."""
     pull()
     path = gsd.get_today_path()
@@ -95,6 +96,22 @@ def ensure_today() -> None:
         path.write_text(gsd._serialize(sections))
         push("create today with carry-forward")
         print(f"[gsd] created {path.name} with carry-forward")
+        return
+
+    # File exists — check if it has the right structure.
+    text = path.read_text()
+    if "## Ayush" in text and "## Rohit" in text:
+        return  # already correct
+
+    # Wrong format — migrate. Preserve any existing tasks under Ayush's No Sleep.
+    import re
+    sections = gsd._carry_forward()
+    for line in text.splitlines():
+        if re.match(r"\s*- \[.\]", line):
+            sections["ayush_no_sleep"].append(line)
+    path.write_text(gsd._serialize(sections))
+    push("migrate today's file to Ayush/Rohit format")
+    print(f"[gsd] migrated {path.name} to correct format")
 
 
 def run() -> None:
