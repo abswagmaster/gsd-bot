@@ -238,6 +238,12 @@ class NoteStore: ObservableObject {
             currentNotebook = "Daily"
         }
 
+        // Open on the logical "today" (day boundary is 4 AM, not midnight)
+        currentDate = Self.logicalToday()
+
+        // Carry unchecked tasks forward into today's file if 4 AM has passed
+        performCarryForwardIfNeeded()
+
         // Load today's note, applying carry-forward template if empty
         let loaded = loadFile(for: currentDate)
         if loaded.isEmpty {
@@ -250,6 +256,17 @@ class NoteStore: ObservableObject {
 
         scanExistingNotes()
         startWatchingCurrentFile()
+    }
+
+    /// The logical "today" — the calendar day, but the boundary is 4 AM.
+    /// Before 4 AM, the previous day is still considered current.
+    static func logicalToday() -> Date {
+        let now = Date()
+        let hour = calendar.component(.hour, from: now)
+        if hour < 4 {
+            return calendar.date(byAdding: .day, value: -1, to: now) ?? now
+        }
+        return now
     }
 
     // MARK: - Notebook management
@@ -418,6 +435,8 @@ class NoteStore: ObservableObject {
 
     private func pollMerge() {
         mergeFromDisk()
+        // Cheap UserDefaults check — runs the real carry-forward only once per day
+        performCarryForwardIfNeeded()
         guard fileWatcher != nil else { return }
         DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
             self?.pollMerge()
@@ -477,7 +496,8 @@ class NoteStore: ObservableObject {
     }
 
     func goToToday() {
-        navigateTo(date: Date())
+        performCarryForwardIfNeeded()
+        navigateTo(date: Self.logicalToday())
     }
 
     func refreshIfNeeded() {
@@ -584,6 +604,57 @@ class NoteStore: ObservableObject {
         ### Best Effort
 
         """
+    }
+
+    /// At/after 4 AM each day, carry every unchecked task from the most recent
+    /// previous day into today's file. Runs once per logical day (tracked in
+    /// UserDefaults). Safe to call repeatedly.
+    func performCarryForwardIfNeeded() {
+        let today = Self.logicalToday()
+        let todayKey = Self.fileFormatter.string(from: today)
+        if UserDefaults.standard.string(forKey: "lastCarryForward") == todayKey { return }
+
+        // Find the most recent previous day's file (look back up to 30 days)
+        var prevText = ""
+        for back in 1...30 {
+            guard let d = Self.calendar.date(byAdding: .day, value: -back, to: today) else { break }
+            let p = filePath(for: d)
+            if let t = try? String(contentsOf: p, encoding: .utf8), !t.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                prevText = t
+                break
+            }
+        }
+
+        // Today's file (or a fresh blank template)
+        let todayPath = filePath(for: today)
+        var todayText = (try? String(contentsOf: todayPath, encoding: .utf8)) ?? ""
+        if todayText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            todayText = generateCarryForward(for: today)
+        }
+
+        if !prevText.isEmpty {
+            // Build a note of ONLY the previous day's unchecked tasks
+            let prevSecs = _gsdParseSections(prevText)
+            var uncheckedOnly: [String: [String]] = [:]
+            for (k, lines) in prevSecs {
+                uncheckedOnly[k] = lines.filter {
+                    if _gsdTaskText($0) != nil, !_gsdIsChecked($0) { return true }
+                    return false
+                }
+            }
+            let prevUnchecked = _gsdSerialize(uncheckedOnly)
+            // mergeNotes unions tasks and dedupes — exactly the carry-forward we want
+            todayText = mergeNotes(todayText, prevUnchecked)
+        }
+
+        try? todayText.write(to: todayPath, atomically: true, encoding: .utf8)
+        UserDefaults.standard.set(todayKey, forKey: "lastCarryForward")
+
+        // If we're currently viewing today, refresh the editor
+        if Self.calendar.isDate(currentDate, inSameDayAs: today) {
+            text = todayText
+            lastSavedText = todayText
+        }
     }
 
     // MARK: - Checkbox toggling
@@ -1514,6 +1585,20 @@ private func _gsdParseSections(_ text: String) -> [String: [String]] {
         if !key.isEmpty { result[key, default: []].append(line) }
     }
     return result
+}
+
+/// Serialize section -> raw lines back into an Ayush/Rohit note.
+private func _gsdSerialize(_ sections: [String: [String]]) -> String {
+    var output = ""
+    for key in _gsdSectionOrder {
+        let parts = key.components(separatedBy: "/")
+        let person = parts[0], sub = parts[1]
+        if sub == "No Sleep" { output += "## \(person)\n\n" }
+        output += "### \(sub)\n"
+        for line in sections[key] ?? [] { output += line + "\n" }
+        output += "\n"
+    }
+    return output
 }
 
 private func _gsdTaskText(_ line: String) -> String? {
