@@ -201,6 +201,7 @@ class NoteStore: ObservableObject {
     private var fileWatcher: DispatchSourceFileSystemObject?
     private var lastSavedText: String = ""
     private var isReloadingFromDisk = false
+    private var lastEditTime = Date.distantPast
 
     static let fileFormatter: DateFormatter = {
         let f = DateFormatter()
@@ -385,6 +386,7 @@ class NoteStore: ObservableObject {
     }
 
     func scheduleSave() {
+        lastEditTime = Date()
         saveTask?.cancel()
         let task = DispatchWorkItem { [weak self] in
             self?.save()
@@ -446,8 +448,15 @@ class NoteStore: ObservableObject {
     /// Merge the on-disk version with our in-memory text so neither side's
     /// additions or check-offs are lost (last-write-wins would drop data).
     private func mergeFromDisk() {
+        // Don't merge while the user is actively editing — otherwise half-typed
+        // states ("u", "up", "uplo"...) get unioned in as separate tasks.
+        if saveTask != nil { return }
+        if Date().timeIntervalSince(lastEditTime) < 2.0 { return }
+
         let onDisk = loadFile(for: currentDate)
         if onDisk.isEmpty || onDisk == text { return }
+        // Our own save echoing back through the watcher — not an external change.
+        if onDisk == lastSavedText { return }
         // Only a real format note can be merged; ignore anything unexpected.
         guard onDisk.contains("## Ayush") || onDisk.contains("## Rohit") else { return }
 
