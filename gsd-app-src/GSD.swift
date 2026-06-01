@@ -445,11 +445,11 @@ class NoteStore: ObservableObject {
         }
     }
 
-    /// Merge the on-disk version with our in-memory text so neither side's
-    /// additions or check-offs are lost (last-write-wins would drop data).
+    /// Pick up the other person's changes by replacing our text with the
+    /// on-disk version — but only when the user is idle so we don't clobber
+    /// in-progress edits or echo half-typed states as separate tasks.
     private func mergeFromDisk() {
-        // Don't merge while the user is actively editing — otherwise half-typed
-        // states ("u", "up", "uplo"...) get unioned in as separate tasks.
+        // Skip while the user is actively editing
         if saveTask != nil { return }
         if Date().timeIntervalSince(lastEditTime) < 2.0 { return }
 
@@ -457,22 +457,15 @@ class NoteStore: ObservableObject {
         if onDisk.isEmpty || onDisk == text { return }
         // Our own save echoing back through the watcher — not an external change.
         if onDisk == lastSavedText { return }
-        // Only a real format note can be merged; ignore anything unexpected.
         guard onDisk.contains("## Ayush") || onDisk.contains("## Rohit") else { return }
 
-        let merged = mergeNotes(text, onDisk)
-        if merged != text {
-            isReloadingFromDisk = true
-            text = merged
-            isReloadingFromDisk = false
-        }
-        // Write back only if the task SET changed — avoids reorder ping-pong.
-        if gsdTaskSignatures(merged) != gsdTaskSignatures(onDisk) {
-            lastSavedText = merged
-            try? merged.write(to: currentFilePath, atomically: true, encoding: .utf8)
-        } else {
-            lastSavedText = onDisk
-        }
+        // Last-write-wins replace — simple and predictable. No union/merge,
+        // so editing a task's text won't appear as "delete + add" on the
+        // other machine.
+        isReloadingFromDisk = true
+        text = onDisk
+        lastSavedText = onDisk
+        isReloadingFromDisk = false
     }
 
     // MARK: - Navigation
