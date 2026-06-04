@@ -281,26 +281,13 @@ class NoteStore: ObservableObject {
     private var isReloadingFromDisk = false
     private var lastEditTime = Date.distantPast
 
-    // MARK: - Firebase identity & polling
-    /// "ayush" or "rohit" — which side of the list this Mac edits.
-    var identity: String = ""
+    // MARK: - Firebase sync state
     private var firebasePollTimer: Timer?
-
-    /// Prompt the user on first launch to identify themselves.
-    static func ensureIdentity() -> String {
-        if let saved = UserDefaults.standard.string(forKey: "gsdIdentity"),
-           !saved.isEmpty {
-            return saved
-        }
-        let alert = NSAlert()
-        alert.messageText = "Who are you?"
-        alert.informativeText = "GSD needs to know which side of the list is yours. This is asked once."
-        alert.addButton(withTitle: "Ayush")
-        alert.addButton(withTitle: "Rohit")
-        let chosen = alert.runModal() == .alertFirstButtonReturn ? "ayush" : "rohit"
-        UserDefaults.standard.set(chosen, forKey: "gsdIdentity")
-        return chosen
-    }
+    /// Last known contents of each person's section from Firebase. Used to
+    /// detect which sections WE changed locally so we only push those — never
+    /// stomp on the other person's section with our stale cached copy.
+    private var lastFetchedAyush: String = ""
+    private var lastFetchedRohit: String = ""
 
     static let fileFormatter: DateFormatter = {
         let f = DateFormatter()
@@ -337,9 +324,6 @@ class NoteStore: ObservableObject {
         if !notebooks.contains(currentNotebook) {
             currentNotebook = "Daily"
         }
-
-        // Identify which person this Mac is. Prompts on first launch.
-        identity = Self.ensureIdentity()
 
         // Open on the logical "today" (day boundary is 4 AM, not midnight)
         currentDate = Self.logicalToday()
@@ -487,11 +471,21 @@ class NoteStore: ObservableObject {
         try? text.write(to: path, atomically: true, encoding: .utf8)
         datesWithNotes.insert(dc)
 
-        // Push ONLY this user's section to Firebase. Never touches the other
-        // person's data — no conflicts ever.
+        // Push to Firebase: only the sections WE actually modified. Compare
+        // each person's current content to what we last fetched. If unchanged,
+        // we don't touch that field — so we never overwrite the other Mac's
+        // newer content with our stale cached copy.
         let dateKey = Self.fileFormatter.string(from: currentDate)
-        let myContent = extractPersonSection(text, person: identity)
-        FirebaseDB.write(dateKey: dateKey, person: identity, content: myContent)
+        let currAyush = extractPersonSection(text, person: "ayush")
+        let currRohit = extractPersonSection(text, person: "rohit")
+        if currAyush != lastFetchedAyush {
+            FirebaseDB.write(dateKey: dateKey, person: "ayush", content: currAyush)
+            lastFetchedAyush = currAyush
+        }
+        if currRohit != lastFetchedRohit {
+            FirebaseDB.write(dateKey: dateKey, person: "rohit", content: currRohit)
+            lastFetchedRohit = currRohit
+        }
     }
 
     func scheduleSave() {
@@ -539,6 +533,11 @@ class NoteStore: ObservableObject {
                 if self.saveTask != nil { return }
                 if Date().timeIntervalSince(self.lastEditTime) < 2.0 { return }
 
+                // Cache what's on Firebase so save() knows which fields are
+                // locally modified vs untouched.
+                self.lastFetchedAyush = ayush ?? ""
+                self.lastFetchedRohit = rohit ?? ""
+
                 let assembled = assembleDisplay(ayush: ayush, rohit: rohit)
                 if assembled == self.text { return }
                 if assembled == self.lastSavedText { return }
@@ -546,7 +545,6 @@ class NoteStore: ObservableObject {
                 self.isReloadingFromDisk = true
                 self.text = assembled
                 self.lastSavedText = assembled
-                // Also cache to local file so opening offline shows latest
                 try? assembled.write(to: self.currentFilePath, atomically: true, encoding: .utf8)
                 self.isReloadingFromDisk = false
             }
