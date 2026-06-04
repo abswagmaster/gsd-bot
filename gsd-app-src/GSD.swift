@@ -201,68 +201,33 @@ struct LaunchAtLogin {
 enum FirebaseDB {
     static let baseURL = "https://get-shit-done-ea870-default-rtdb.firebaseio.com"
 
-    /// GET notes/{date}.json → (ayush, rohit) markdown strings
-    static func fetch(dateKey: String, completion: @escaping (String?, String?) -> Void) {
-        guard let url = URL(string: "\(baseURL)/notes/\(dateKey).json") else {
-            completion(nil, nil); return
+    /// GET notes/{date}/content.json → the full markdown for that day.
+    static func fetch(dateKey: String, completion: @escaping (String?) -> Void) {
+        guard let url = URL(string: "\(baseURL)/notes/\(dateKey)/content.json") else {
+            completion(nil); return
         }
-        let task = URLSession.shared.dataTask(with: url) { data, _, _ in
-            guard let data = data else { completion(nil, nil); return }
-            // null body when no data for that date
+        URLSession.shared.dataTask(with: url) { data, _, _ in
+            guard let data = data else { completion(nil); return }
             if data.count == 4, String(data: data, encoding: .utf8) == "null" {
-                completion(nil, nil); return
+                completion(nil); return
             }
-            if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-                completion(json["ayush"] as? String, json["rohit"] as? String)
+            if let s = try? JSONDecoder().decode(String.self, from: data) {
+                completion(s)
             } else {
-                completion(nil, nil)
+                completion(nil)
             }
-        }
-        task.resume()
+        }.resume()
     }
 
-    /// PUT notes/{date}/{person}.json with the given markdown string.
-    static func write(dateKey: String, person: String, content: String) {
-        guard let url = URL(string: "\(baseURL)/notes/\(dateKey)/\(person).json") else { return }
+    /// PUT notes/{date}/content.json with the full note markdown.
+    static func write(dateKey: String, content: String) {
+        guard let url = URL(string: "\(baseURL)/notes/\(dateKey)/content.json") else { return }
         var req = URLRequest(url: url)
         req.httpMethod = "PUT"
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         req.httpBody = try? JSONEncoder().encode(content)
         URLSession.shared.dataTask(with: req).resume()
     }
-}
-
-/// Build the editor-displayed text from a person's own section markdown strings.
-func assembleDisplay(ayush: String?, rohit: String?) -> String {
-    let defaultBlock = "### No Sleep\n\n### Best Effort\n"
-    let a = (ayush?.isEmpty == false) ? ayush! : defaultBlock
-    let r = (rohit?.isEmpty == false) ? rohit! : defaultBlock
-    return "## Ayush\n\n" + a + (a.hasSuffix("\n") ? "" : "\n") + "\n## Rohit\n\n" + r + (r.hasSuffix("\n") ? "" : "\n")
-}
-
-/// Extract the lines belonging to a single person ("ayush" or "rohit") from the
-/// full displayed text. Returns content WITHOUT the "## Person" header.
-func extractPersonSection(_ text: String, person: String) -> String {
-    let header = "## " + person.capitalized
-    let lines = text.components(separatedBy: "\n")
-    var capturing = false
-    var out: [String] = []
-    for line in lines {
-        let t = line.trimmingCharacters(in: .whitespaces)
-        if t == "## Ayush" || t == "## Rohit" {
-            capturing = (t == header)
-            continue
-        }
-        if capturing { out.append(line) }
-    }
-    // Strip leading/trailing blank lines
-    while let first = out.first, first.trimmingCharacters(in: .whitespaces).isEmpty {
-        out.removeFirst()
-    }
-    while let last = out.last, last.trimmingCharacters(in: .whitespaces).isEmpty {
-        out.removeLast()
-    }
-    return out.joined(separator: "\n") + "\n"
 }
 
 // MARK: - Note Storage
@@ -283,11 +248,6 @@ class NoteStore: ObservableObject {
 
     // MARK: - Firebase sync state
     private var firebasePollTimer: Timer?
-    /// Last known contents of each person's section from Firebase. Used to
-    /// detect which sections WE changed locally so we only push those — never
-    /// stomp on the other person's section with our stale cached copy.
-    private var lastFetchedAyush: String = ""
-    private var lastFetchedRohit: String = ""
 
     static let fileFormatter: DateFormatter = {
         let f = DateFormatter()
@@ -471,21 +431,9 @@ class NoteStore: ObservableObject {
         try? text.write(to: path, atomically: true, encoding: .utf8)
         datesWithNotes.insert(dc)
 
-        // Push to Firebase: only the sections WE actually modified. Compare
-        // each person's current content to what we last fetched. If unchanged,
-        // we don't touch that field — so we never overwrite the other Mac's
-        // newer content with our stale cached copy.
+        // Push the whole doc to Firebase. Single shared note — anyone can edit anywhere.
         let dateKey = Self.fileFormatter.string(from: currentDate)
-        let currAyush = extractPersonSection(text, person: "ayush")
-        let currRohit = extractPersonSection(text, person: "rohit")
-        if currAyush != lastFetchedAyush {
-            FirebaseDB.write(dateKey: dateKey, person: "ayush", content: currAyush)
-            lastFetchedAyush = currAyush
-        }
-        if currRohit != lastFetchedRohit {
-            FirebaseDB.write(dateKey: dateKey, person: "rohit", content: currRohit)
-            lastFetchedRohit = currRohit
-        }
+        FirebaseDB.write(dateKey: dateKey, content: text)
     }
 
     func scheduleSave() {
@@ -521,31 +469,22 @@ class NoteStore: ObservableObject {
     /// Pull latest from Firebase. If the user is idle and the assembled
     /// remote text differs from what's showing, update.
     private func fetchFromFirebaseAndUpdate() {
-        // Don't clobber in-progress edits
         if saveTask != nil { return }
         if Date().timeIntervalSince(lastEditTime) < 2.0 { return }
 
         let dateKey = Self.fileFormatter.string(from: currentDate)
-        FirebaseDB.fetch(dateKey: dateKey) { [weak self] ayush, rohit in
+        FirebaseDB.fetch(dateKey: dateKey) { [weak self] remote in
             DispatchQueue.main.async {
-                guard let self = self else { return }
-                // Double-check the user didn't start typing during the network round-trip
+                guard let self = self, let remote = remote else { return }
                 if self.saveTask != nil { return }
                 if Date().timeIntervalSince(self.lastEditTime) < 2.0 { return }
-
-                // Cache what's on Firebase so save() knows which fields are
-                // locally modified vs untouched.
-                self.lastFetchedAyush = ayush ?? ""
-                self.lastFetchedRohit = rohit ?? ""
-
-                let assembled = assembleDisplay(ayush: ayush, rohit: rohit)
-                if assembled == self.text { return }
-                if assembled == self.lastSavedText { return }
+                if remote == self.text { return }
+                if remote == self.lastSavedText { return }
 
                 self.isReloadingFromDisk = true
-                self.text = assembled
-                self.lastSavedText = assembled
-                try? assembled.write(to: self.currentFilePath, atomically: true, encoding: .utf8)
+                self.text = remote
+                self.lastSavedText = remote
+                try? remote.write(to: self.currentFilePath, atomically: true, encoding: .utf8)
                 self.isReloadingFromDisk = false
             }
         }
