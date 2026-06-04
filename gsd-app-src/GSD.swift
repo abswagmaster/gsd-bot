@@ -187,6 +187,84 @@ struct LaunchAtLogin {
     }
 }
 
+// MARK: - Firebase Realtime Database (sync backend)
+//
+// Data model:
+//   notes/
+//     {YYYY-MM-DD}/
+//       ayush: "<markdown of Ayush's sections>"
+//       rohit: "<markdown of Rohit's sections>"
+//
+// Each Mac knows whether it is Ayush or Rohit (stored in UserDefaults).
+// On save, only the current user's own field is written — no conflicts.
+
+enum FirebaseDB {
+    static let baseURL = "https://get-shit-done-ea870-default-rtdb.firebaseio.com"
+
+    /// GET notes/{date}.json → (ayush, rohit) markdown strings
+    static func fetch(dateKey: String, completion: @escaping (String?, String?) -> Void) {
+        guard let url = URL(string: "\(baseURL)/notes/\(dateKey).json") else {
+            completion(nil, nil); return
+        }
+        let task = URLSession.shared.dataTask(with: url) { data, _, _ in
+            guard let data = data else { completion(nil, nil); return }
+            // null body when no data for that date
+            if data.count == 4, String(data: data, encoding: .utf8) == "null" {
+                completion(nil, nil); return
+            }
+            if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                completion(json["ayush"] as? String, json["rohit"] as? String)
+            } else {
+                completion(nil, nil)
+            }
+        }
+        task.resume()
+    }
+
+    /// PUT notes/{date}/{person}.json with the given markdown string.
+    static func write(dateKey: String, person: String, content: String) {
+        guard let url = URL(string: "\(baseURL)/notes/\(dateKey)/\(person).json") else { return }
+        var req = URLRequest(url: url)
+        req.httpMethod = "PUT"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.httpBody = try? JSONEncoder().encode(content)
+        URLSession.shared.dataTask(with: req).resume()
+    }
+}
+
+/// Build the editor-displayed text from a person's own section markdown strings.
+func assembleDisplay(ayush: String?, rohit: String?) -> String {
+    let defaultBlock = "### No Sleep\n\n### Best Effort\n"
+    let a = (ayush?.isEmpty == false) ? ayush! : defaultBlock
+    let r = (rohit?.isEmpty == false) ? rohit! : defaultBlock
+    return "## Ayush\n\n" + a + (a.hasSuffix("\n") ? "" : "\n") + "\n## Rohit\n\n" + r + (r.hasSuffix("\n") ? "" : "\n")
+}
+
+/// Extract the lines belonging to a single person ("ayush" or "rohit") from the
+/// full displayed text. Returns content WITHOUT the "## Person" header.
+func extractPersonSection(_ text: String, person: String) -> String {
+    let header = "## " + person.capitalized
+    let lines = text.components(separatedBy: "\n")
+    var capturing = false
+    var out: [String] = []
+    for line in lines {
+        let t = line.trimmingCharacters(in: .whitespaces)
+        if t == "## Ayush" || t == "## Rohit" {
+            capturing = (t == header)
+            continue
+        }
+        if capturing { out.append(line) }
+    }
+    // Strip leading/trailing blank lines
+    while let first = out.first, first.trimmingCharacters(in: .whitespaces).isEmpty {
+        out.removeFirst()
+    }
+    while let last = out.last, last.trimmingCharacters(in: .whitespaces).isEmpty {
+        out.removeLast()
+    }
+    return out.joined(separator: "\n") + "\n"
+}
+
 // MARK: - Note Storage
 
 class NoteStore: ObservableObject {
@@ -202,6 +280,27 @@ class NoteStore: ObservableObject {
     private var lastSavedText: String = ""
     private var isReloadingFromDisk = false
     private var lastEditTime = Date.distantPast
+
+    // MARK: - Firebase identity & polling
+    /// "ayush" or "rohit" — which side of the list this Mac edits.
+    var identity: String = ""
+    private var firebasePollTimer: Timer?
+
+    /// Prompt the user on first launch to identify themselves.
+    static func ensureIdentity() -> String {
+        if let saved = UserDefaults.standard.string(forKey: "gsdIdentity"),
+           !saved.isEmpty {
+            return saved
+        }
+        let alert = NSAlert()
+        alert.messageText = "Who are you?"
+        alert.informativeText = "GSD needs to know which side of the list is yours. This is asked once."
+        alert.addButton(withTitle: "Ayush")
+        alert.addButton(withTitle: "Rohit")
+        let chosen = alert.runModal() == .alertFirstButtonReturn ? "ayush" : "rohit"
+        UserDefaults.standard.set(chosen, forKey: "gsdIdentity")
+        return chosen
+    }
 
     static let fileFormatter: DateFormatter = {
         let f = DateFormatter()
@@ -238,6 +337,9 @@ class NoteStore: ObservableObject {
         if !notebooks.contains(currentNotebook) {
             currentNotebook = "Daily"
         }
+
+        // Identify which person this Mac is. Prompts on first launch.
+        identity = Self.ensureIdentity()
 
         // Open on the logical "today" (day boundary is 4 AM, not midnight)
         currentDate = Self.logicalToday()
@@ -377,12 +479,19 @@ class NoteStore: ObservableObject {
         let dc = Self.calendar.dateComponents([.year, .month, .day], from: currentDate)
 
         if text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            // Never delete — write a blank template instead so the file persists.
             text = generateCarryForward(for: currentDate)
         }
         lastSavedText = text
+
+        // Local file = cache for offline reads / debugging
         try? text.write(to: path, atomically: true, encoding: .utf8)
         datesWithNotes.insert(dc)
+
+        // Push ONLY this user's section to Firebase. Never touches the other
+        // person's data — no conflicts ever.
+        let dateKey = Self.fileFormatter.string(from: currentDate)
+        let myContent = extractPersonSection(text, person: identity)
+        FirebaseDB.write(dateKey: dateKey, person: identity, content: myContent)
     }
 
     func scheduleSave() {
@@ -396,76 +505,52 @@ class NoteStore: ObservableObject {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5, execute: task)
     }
 
-    // MARK: - Live file watching + merge (handles iCloud concurrent edits)
+    // MARK: - Firebase live sync (replaces file watching)
 
+    /// Start polling Firebase for changes to the current date.
     func startWatchingCurrentFile() {
         stopWatchingCurrentFile()
-        let url = currentFilePath
-        let path = url.path
-        try? FileManager.default.startDownloadingUbiquitousItem(at: url)
-        if !FileManager.default.fileExists(atPath: path) {
-            try? text.write(to: url, atomically: true, encoding: .utf8)
-        }
-        let fd = open(path, O_EVTONLY)
-        if fd >= 0 {
-            let source = DispatchSource.makeFileSystemObjectSource(
-                fileDescriptor: fd,
-                eventMask: [.write, .extend, .delete, .rename, .attrib],
-                queue: DispatchQueue.main)
-            source.setEventHandler { [weak self] in
-                guard let self = self else { return }
-                let mask = source.data
-                if mask.contains(.delete) || mask.contains(.rename) {
-                    self.startWatchingCurrentFile()
-                }
-                self.mergeFromDisk()
-            }
-            source.setCancelHandler { close(fd) }
-            source.resume()
-            fileWatcher = source
-        }
-        // Poll fallback for iCloud updates that don't emit fs events
-        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
-            self?.pollMerge()
+        // Immediate fetch
+        fetchFromFirebaseAndUpdate()
+        // Then every 2s while we're viewing this date
+        firebasePollTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
+            self?.fetchFromFirebaseAndUpdate()
+            self?.performCarryForwardIfNeeded()
         }
     }
 
     func stopWatchingCurrentFile() {
-        fileWatcher?.cancel()
-        fileWatcher = nil
+        firebasePollTimer?.invalidate()
+        firebasePollTimer = nil
     }
 
-    private func pollMerge() {
-        mergeFromDisk()
-        // Cheap UserDefaults check — runs the real carry-forward only once per day
-        performCarryForwardIfNeeded()
-        guard fileWatcher != nil else { return }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
-            self?.pollMerge()
-        }
-    }
-
-    /// Pick up the other person's changes by replacing our text with the
-    /// on-disk version — but only when the user is idle so we don't clobber
-    /// in-progress edits or echo half-typed states as separate tasks.
-    private func mergeFromDisk() {
-        // Skip while the user is actively editing
+    /// Pull latest from Firebase. If the user is idle and the assembled
+    /// remote text differs from what's showing, update.
+    private func fetchFromFirebaseAndUpdate() {
+        // Don't clobber in-progress edits
         if saveTask != nil { return }
         if Date().timeIntervalSince(lastEditTime) < 2.0 { return }
 
-        let onDisk = loadFile(for: currentDate)
-        if onDisk.isEmpty || onDisk == text { return }
-        // Our own save echoing back through the watcher — not an external change.
-        if onDisk == lastSavedText { return }
-        guard onDisk.contains("## Ayush") || onDisk.contains("## Rohit") else { return }
+        let dateKey = Self.fileFormatter.string(from: currentDate)
+        FirebaseDB.fetch(dateKey: dateKey) { [weak self] ayush, rohit in
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                // Double-check the user didn't start typing during the network round-trip
+                if self.saveTask != nil { return }
+                if Date().timeIntervalSince(self.lastEditTime) < 2.0 { return }
 
-        // Last-write-wins replace — simple and predictable. No union/merge,
-        // so editing a task's text won't appear as "delete + add" on the
-        // other machine.
-        isReloadingFromDisk = true
-        text = onDisk
-        lastSavedText = onDisk
-        isReloadingFromDisk = false
+                let assembled = assembleDisplay(ayush: ayush, rohit: rohit)
+                if assembled == self.text { return }
+                if assembled == self.lastSavedText { return }
+
+                self.isReloadingFromDisk = true
+                self.text = assembled
+                self.lastSavedText = assembled
+                // Also cache to local file so opening offline shows latest
+                try? assembled.write(to: self.currentFilePath, atomically: true, encoding: .utf8)
+                self.isReloadingFromDisk = false
+            }
+        }
     }
 
     // MARK: - Navigation
