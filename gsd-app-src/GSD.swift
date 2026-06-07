@@ -621,11 +621,15 @@ class NoteStore: ObservableObject {
 
         ### Best Effort
 
+        #### Weekly goal
+
         ## Rohit
 
         ### No Sleep
 
         ### Best Effort
+
+        #### Weekly goal
 
         """
     }
@@ -640,11 +644,13 @@ class NoteStore: ObservableObject {
 
         // Find the most recent previous day's file (look back up to 30 days)
         var prevText = ""
+        var prevDate: Date? = nil
         for back in 1...30 {
             guard let d = Self.calendar.date(byAdding: .day, value: -back, to: today) else { break }
             let p = filePath(for: d)
             if let t = try? String(contentsOf: p, encoding: .utf8), !t.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 prevText = t
+                prevDate = d
                 break
             }
         }
@@ -657,22 +663,35 @@ class NoteStore: ObservableObject {
         }
 
         if !prevText.isEmpty {
-            // Build a note of ONLY the previous day's unchecked tasks
             let prevSecs = _gsdParseSections(prevText)
-            var uncheckedOnly: [String: [String]] = [:]
+            // Weekly goals carry over only if previous day is in the same week.
+            let sameWeek: Bool = {
+                guard let prevDate = prevDate else { return false }
+                return Self.calendar.isDate(today, equalTo: prevDate, toGranularity: .weekOfYear)
+            }()
+
+            var carry: [String: [String]] = [:]
             for (k, lines) in prevSecs {
-                uncheckedOnly[k] = lines.filter {
-                    if _gsdTaskText($0) != nil, !_gsdIsChecked($0) { return true }
-                    return false
+                if k.hasSuffix("/Weekly goal") {
+                    // Carry the entire weekly goal section if same week, else drop
+                    carry[k] = sameWeek ? lines : []
+                } else {
+                    // No Sleep / Best Effort: carry only unchecked tasks
+                    carry[k] = lines.filter {
+                        if _gsdTaskText($0) != nil, !_gsdIsChecked($0) { return true }
+                        return false
+                    }
                 }
             }
-            let prevUnchecked = _gsdSerialize(uncheckedOnly)
-            // mergeNotes unions tasks and dedupes — exactly the carry-forward we want
-            todayText = mergeNotes(todayText, prevUnchecked)
+            let prevCarry = _gsdSerialize(carry)
+            todayText = mergeNotes(todayText, prevCarry)
         }
 
         try? todayText.write(to: todayPath, atomically: true, encoding: .utf8)
         UserDefaults.standard.set(todayKey, forKey: "lastCarryForward")
+
+        // Push the carried-forward state to Firebase so the other Mac sees it too
+        FirebaseDB.write(dateKey: todayKey, content: todayText)
 
         // If we're currently viewing today, refresh the editor
         if Self.calendar.isDate(currentDate, inSameDayAs: today) {
@@ -1591,7 +1610,8 @@ private func storageText(from display: String) -> String {
 // MARK: - Note merging (handles concurrent iCloud edits without losing data)
 
 private let _gsdSectionOrder = [
-    "Ayush/No Sleep", "Ayush/Best Effort", "Rohit/No Sleep", "Rohit/Best Effort",
+    "Ayush/No Sleep", "Ayush/Best Effort", "Ayush/Weekly goal",
+    "Rohit/No Sleep", "Rohit/Best Effort", "Rohit/Weekly goal",
 ]
 
 /// Parse an Ayush/Rohit note into section -> list of task lines.
@@ -1605,7 +1625,10 @@ private func _gsdParseSections(_ text: String) -> [String: [String]] {
         if t == "## Rohit" { person = "Rohit"; key = ""; continue }
         if t == "### No Sleep" { key = person + "/No Sleep"; result[key] = []; continue }
         if t == "### Best Effort" { key = person + "/Best Effort"; result[key] = []; continue }
-        if t.hasPrefix("## ") || t.hasPrefix("### ") { key = ""; continue }
+        if t == "#### Weekly goal" { key = person + "/Weekly goal"; result[key] = []; continue }
+        if t.hasPrefix("## ") || t.hasPrefix("### ") || t.hasPrefix("#### ") {
+            key = ""; continue
+        }
         if !key.isEmpty { result[key, default: []].append(line) }
     }
     return result
@@ -1618,7 +1641,8 @@ private func _gsdSerialize(_ sections: [String: [String]]) -> String {
         let parts = key.components(separatedBy: "/")
         let person = parts[0], sub = parts[1]
         if sub == "No Sleep" { output += "## \(person)\n\n" }
-        output += "### \(sub)\n"
+        let headerMark = sub == "Weekly goal" ? "#### " : "### "
+        output += "\(headerMark)\(sub)\n"
         for line in sections[key] ?? [] { output += line + "\n" }
         output += "\n"
     }
@@ -1648,7 +1672,29 @@ func mergeNotes(_ mine: String, _ theirs: String) -> String {
         let parts = key.components(separatedBy: "/")
         let person = parts[0], sub = parts[1]
         if sub == "No Sleep" { output += "## \(person)\n\n" }
-        output += "### \(sub)\n"
+        let headerMark = sub == "Weekly goal" ? "#### " : "### "
+        output += "\(headerMark)\(sub)\n"
+
+        // Weekly goal: free-text section, preserve all lines (mine first, then
+        // theirs lines not already in mine). No checkbox-only filtering.
+        if sub == "Weekly goal" {
+            let mineLines = mineSecs[key] ?? []
+            let theirsLines = theirSecs[key] ?? []
+            var seen = Set<String>()
+            for line in mineLines + theirsLines {
+                let key = line.trimmingCharacters(in: .whitespaces)
+                if key.isEmpty {
+                    output += "\n"
+                    continue
+                }
+                if !seen.contains(key) {
+                    seen.insert(key)
+                    output += line + "\n"
+                }
+            }
+            output += "\n"
+            continue
+        }
 
         var order: [String] = []          // task texts, preserve mine-first order
         var checked: [String: Bool] = [:] // lowercased text -> checked
