@@ -635,15 +635,11 @@ class NoteStore: ObservableObject {
 
         ### Best Effort
 
-        #### Weekly goal
-
         ## Rohit
 
         ### No Sleep
 
         ### Best Effort
-
-        #### Weekly goal
 
         """
     }
@@ -1626,8 +1622,8 @@ private func storageText(from display: String) -> String {
 // MARK: - Note merging (handles concurrent iCloud edits without losing data)
 
 private let _gsdSectionOrder = [
-    "Ayush/No Sleep", "Ayush/Best Effort", "Ayush/Weekly goal",
-    "Rohit/No Sleep", "Rohit/Best Effort", "Rohit/Weekly goal",
+    "Ayush/No Sleep", "Ayush/Best Effort",
+    "Rohit/No Sleep", "Rohit/Best Effort",
 ]
 
 /// Parse an Ayush/Rohit note into section -> list of task lines.
