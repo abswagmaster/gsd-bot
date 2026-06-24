@@ -198,6 +198,10 @@ struct LaunchAtLogin {
 // Each Mac knows whether it is Ayush or Rohit (stored in UserDefaults).
 // On save, only the current user's own field is written — no conflicts.
 
+/// Globally readable current notebook so MarkdownNSTextView can switch behavior
+/// (e.g. always-auto-checkbox in the Weekly goals notebook). NoteStore keeps it in sync.
+var gsdCurrentNotebook: String = "Daily"
+
 enum FirebaseDB {
     static let baseURL = "https://get-shit-done-ea870-default-rtdb.firebaseio.com"
 
@@ -292,6 +296,7 @@ class NoteStore: ObservableObject {
         if !notebooks.contains(currentNotebook) {
             currentNotebook = "Daily"
         }
+        gsdCurrentNotebook = currentNotebook
 
         // Open on the logical "today" (day boundary is 4 AM, not midnight)
         currentDate = Self.logicalToday()
@@ -350,6 +355,7 @@ class NoteStore: ObservableObject {
     func switchNotebook(to name: String) {
         save()
         currentNotebook = name
+        gsdCurrentNotebook = name
         saveLastNotebook(name)
 
         let loaded = loadFile(for: currentDate)
@@ -642,12 +648,7 @@ class NoteStore: ObservableObject {
 
             """
         case "Weekly goals":
-            return """
-            ## Ayush
-
-            ## Rohit
-
-            """
+            return ""
         default:
             return ""
         }
@@ -711,17 +712,21 @@ class NoteStore: ObservableObject {
                 let prevCarry = _gsdSerialize(carry)
                 todayText = mergeNotes(todayText, prevCarry)
             } else {
-                // Weekly goals
-                let prevSecs = _gsdParseWeeklySections(prevText)
-                var carry: [String: [String]] = [:]
-                for (k, lines) in prevSecs {
-                    carry[k] = lines.filter {
-                        if _gsdTaskText($0) != nil, !_gsdIsChecked($0) { return true }
-                        return false
+                // Weekly goals — flat list of unchecked checkboxes
+                let prevUnchecked = prevText.components(separatedBy: "\n").filter {
+                    _gsdTaskText($0) != nil && !_gsdIsChecked($0)
+                }
+                let todayUnchecked = todayText.components(separatedBy: "\n").filter {
+                    _gsdTaskText($0) != nil
+                }
+                let existing = Set(todayUnchecked.compactMap { _gsdTaskText($0)?.lowercased() })
+                var lines = todayUnchecked
+                for line in prevUnchecked {
+                    if let tt = _gsdTaskText(line), !existing.contains(tt.lowercased()) {
+                        lines.append(line)
                     }
                 }
-                let prevCarry = _gsdSerializeWeekly(carry)
-                todayText = mergeWeeklyNotes(todayText, prevCarry)
+                todayText = lines.joined(separator: "\n") + "\n"
             }
         }
 
@@ -1389,6 +1394,8 @@ class MarkdownNSTextView: NSTextView {
 
     // Is the cursor's line inside a "### " subsection?
     private func isInsideSubsection(lineLocation: Int) -> Bool {
+        // Weekly goals: entire notebook is a flat checklist.
+        if gsdCurrentNotebook == "Weekly goals" { return true }
         let allLines = self.string.components(separatedBy: "\n")
         var charSoFar = 0
         var currentLineIdx = 0
@@ -1397,8 +1404,6 @@ class MarkdownNSTextView: NSTextView {
             charSoFar += l.count + 1
         }
         if currentLineIdx == 0 { return false }
-        // Any heading above the cursor counts (so checkboxes auto-insert under
-        // ## Ayush in Weekly goals, and ### No Sleep / ### Best Effort in Daily).
         for i in stride(from: currentLineIdx - 1, through: 0, by: -1) {
             let t = allLines[i].trimmingCharacters(in: .whitespaces)
             if t.hasPrefix("##") { return true }
