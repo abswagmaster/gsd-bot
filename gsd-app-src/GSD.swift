@@ -625,44 +625,68 @@ class NoteStore: ObservableObject {
     /// Blank Ayush/Rohit template used for any new day's file.
     /// The Python sync daemon handles 4 AM carry-forward of unchecked tasks.
     func generateCarryForward(for date: Date) -> String {
-        // Only the Daily notebook uses the Ayush/Rohit template.
-        // Other notebooks start as blank documents.
-        guard currentNotebook == "Daily" else { return "" }
-        return """
-        ## Ayush
+        switch currentNotebook {
+        case "Daily":
+            return """
+            ## Ayush
 
-        ### No Sleep
+            ### No Sleep
 
-        ### Best Effort
+            ### Best Effort
 
-        ## Rohit
+            ## Rohit
 
-        ### No Sleep
+            ### No Sleep
 
-        ### Best Effort
+            ### Best Effort
 
-        """
+            """
+        case "Weekly goals":
+            return """
+            ## Ayush
+
+            ## Rohit
+
+            """
+        default:
+            return ""
+        }
     }
 
     /// At/after 4 AM each day, carry every unchecked task from the most recent
     /// previous day into today's file. Runs once per logical day (tracked in
     /// UserDefaults). Safe to call repeatedly.
     func performCarryForwardIfNeeded() {
-        // Carry-forward (and the Ayush/Rohit template) only apply to the Daily notebook.
-        guard currentNotebook == "Daily" else { return }
         let today = Self.logicalToday()
         let todayKey = Self.fileFormatter.string(from: today)
-        if UserDefaults.standard.string(forKey: "lastCarryForward") == todayKey { return }
+        // Per-notebook tracker so Daily and Weekly goals each run once per day
+        let trackerKey = "lastCarryForward_\(currentNotebook)"
+        if UserDefaults.standard.string(forKey: trackerKey) == todayKey { return }
+
+        // Weekly goals notebook: Sunday is the reset day — start the week blank.
+        if currentNotebook == "Weekly goals" {
+            let weekday = Self.calendar.component(.weekday, from: today)
+            if weekday == 1 {
+                UserDefaults.standard.set(todayKey, forKey: trackerKey)
+                return
+            }
+        } else if currentNotebook != "Daily" {
+            // No carry-forward for other arbitrary notebooks
+            return
+        }
 
         // Find the most recent previous day's file (look back up to 30 days)
         var prevText = ""
-        var prevDate: Date? = nil
         for back in 1...30 {
             guard let d = Self.calendar.date(byAdding: .day, value: -back, to: today) else { break }
+            // For Weekly goals, only carry within the same Sunday-Saturday week
+            if currentNotebook == "Weekly goals" {
+                let sameWeek = Self.calendar.isDate(today, equalTo: d, toGranularity: .weekOfYear)
+                if !sameWeek { break }
+            }
             let p = filePath(for: d)
             if let t = try? String(contentsOf: p, encoding: .utf8), !t.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 prevText = t
-                prevDate = d
                 break
             }
         }
@@ -675,32 +699,34 @@ class NoteStore: ObservableObject {
         }
 
         if !prevText.isEmpty {
-            let prevSecs = _gsdParseSections(prevText)
-            // Weekly goals carry over only if previous day is in the same week.
-            let sameWeek: Bool = {
-                guard let prevDate = prevDate else { return false }
-                return Self.calendar.isDate(today, equalTo: prevDate, toGranularity: .weekOfYear)
-            }()
-
-            var carry: [String: [String]] = [:]
-            for (k, lines) in prevSecs {
-                if k.hasSuffix("/Weekly goal") {
-                    // Carry the entire weekly goal section if same week, else drop
-                    carry[k] = sameWeek ? lines : []
-                } else {
-                    // No Sleep / Best Effort: carry only unchecked tasks
+            if currentNotebook == "Daily" {
+                let prevSecs = _gsdParseSections(prevText)
+                var carry: [String: [String]] = [:]
+                for (k, lines) in prevSecs {
                     carry[k] = lines.filter {
                         if _gsdTaskText($0) != nil, !_gsdIsChecked($0) { return true }
                         return false
                     }
                 }
+                let prevCarry = _gsdSerialize(carry)
+                todayText = mergeNotes(todayText, prevCarry)
+            } else {
+                // Weekly goals
+                let prevSecs = _gsdParseWeeklySections(prevText)
+                var carry: [String: [String]] = [:]
+                for (k, lines) in prevSecs {
+                    carry[k] = lines.filter {
+                        if _gsdTaskText($0) != nil, !_gsdIsChecked($0) { return true }
+                        return false
+                    }
+                }
+                let prevCarry = _gsdSerializeWeekly(carry)
+                todayText = mergeWeeklyNotes(todayText, prevCarry)
             }
-            let prevCarry = _gsdSerialize(carry)
-            todayText = mergeNotes(todayText, prevCarry)
         }
 
         try? todayText.write(to: todayPath, atomically: true, encoding: .utf8)
-        UserDefaults.standard.set(todayKey, forKey: "lastCarryForward")
+        UserDefaults.standard.set(todayKey, forKey: trackerKey)
 
         // Push the carried-forward state to Firebase so the other Mac sees it too
         FirebaseDB.write(notebook: currentNotebook, dateKey: todayKey, content: todayText)
@@ -1371,10 +1397,11 @@ class MarkdownNSTextView: NSTextView {
             charSoFar += l.count + 1
         }
         if currentLineIdx == 0 { return false }
+        // Any heading above the cursor counts (so checkboxes auto-insert under
+        // ## Ayush in Weekly goals, and ### No Sleep / ### Best Effort in Daily).
         for i in stride(from: currentLineIdx - 1, through: 0, by: -1) {
             let t = allLines[i].trimmingCharacters(in: .whitespaces)
-            if t.hasPrefix("### ") { return true }
-            if t.hasPrefix("## ") { return false }
+            if t.hasPrefix("##") { return true }
         }
         return false
     }
@@ -1625,6 +1652,60 @@ private let _gsdSectionOrder = [
     "Ayush/No Sleep", "Ayush/Best Effort",
     "Rohit/No Sleep", "Rohit/Best Effort",
 ]
+
+// MARK: - Weekly goals notebook (## Ayush / ## Rohit, no sub-sections)
+
+private let _gsdWeeklySectionOrder = ["Ayush", "Rohit"]
+
+private func _gsdParseWeeklySections(_ text: String) -> [String: [String]] {
+    var result: [String: [String]] = [:]
+    var key = ""
+    for line in text.components(separatedBy: "\n") {
+        let t = line.trimmingCharacters(in: .whitespaces)
+        if t == "## Ayush" { key = "Ayush"; result[key] = []; continue }
+        if t == "## Rohit" { key = "Rohit"; result[key] = []; continue }
+        if t.hasPrefix("## ") { key = ""; continue }
+        if !key.isEmpty { result[key, default: []].append(line) }
+    }
+    return result
+}
+
+private func _gsdSerializeWeekly(_ sections: [String: [String]]) -> String {
+    var output = ""
+    for key in _gsdWeeklySectionOrder {
+        output += "## \(key)\n\n"
+        for line in sections[key] ?? [] { output += line + "\n" }
+        output += "\n"
+    }
+    return output
+}
+
+func mergeWeeklyNotes(_ mine: String, _ theirs: String) -> String {
+    let mineSecs = _gsdParseWeeklySections(mine)
+    let theirSecs = _gsdParseWeeklySections(theirs)
+    var output = ""
+    for key in _gsdWeeklySectionOrder {
+        output += "## \(key)\n\n"
+        var order: [String] = []
+        var checked: [String: Bool] = [:]
+        for line in (mineSecs[key] ?? []) + (theirSecs[key] ?? []) {
+            guard let tt = _gsdTaskText(line), !tt.isEmpty else { continue }
+            let normalized = tt.lowercased()
+            if checked[normalized] == nil {
+                order.append(tt)
+                checked[normalized] = _gsdIsChecked(line)
+            } else if _gsdIsChecked(line) {
+                checked[normalized] = true
+            }
+        }
+        for tt in order {
+            let isOn = checked[tt.lowercased()] ?? false
+            output += "- [\(isOn ? "x" : " ")] \(tt)\n"
+        }
+        output += "\n"
+    }
+    return output
+}
 
 /// Parse an Ayush/Rohit note into section -> list of task lines.
 private func _gsdParseSections(_ text: String) -> [String: [String]] {
