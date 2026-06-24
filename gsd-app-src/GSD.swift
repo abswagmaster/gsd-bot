@@ -201,9 +201,16 @@ struct LaunchAtLogin {
 enum FirebaseDB {
     static let baseURL = "https://get-shit-done-ea870-default-rtdb.firebaseio.com"
 
-    /// GET notes/{date}/content.json → the full markdown for that day.
-    static func fetch(dateKey: String, completion: @escaping (String?) -> Void) {
-        guard let url = URL(string: "\(baseURL)/notes/\(dateKey)/content.json") else {
+    /// Firebase path keys can't contain certain characters; escape them.
+    private static func escapePath(_ raw: String) -> String {
+        let bad: Set<Character> = [".", "#", "$", "[", "]", "/"]
+        return String(raw.map { bad.contains($0) ? "_" : $0 })
+    }
+
+    /// GET notebooks/{notebook}/{date}/content.json → full markdown.
+    static func fetch(notebook: String, dateKey: String, completion: @escaping (String?) -> Void) {
+        let nb = escapePath(notebook)
+        guard let url = URL(string: "\(baseURL)/notebooks/\(nb)/\(dateKey)/content.json") else {
             completion(nil); return
         }
         URLSession.shared.dataTask(with: url) { data, _, _ in
@@ -219,9 +226,10 @@ enum FirebaseDB {
         }.resume()
     }
 
-    /// PUT notes/{date}/content.json with the full note markdown.
-    static func write(dateKey: String, content: String) {
-        guard let url = URL(string: "\(baseURL)/notes/\(dateKey)/content.json") else { return }
+    /// PUT notebooks/{notebook}/{date}/content.json with the full note markdown.
+    static func write(notebook: String, dateKey: String, content: String) {
+        let nb = escapePath(notebook)
+        guard let url = URL(string: "\(baseURL)/notebooks/\(nb)/\(dateKey)/content.json") else { return }
         var req = URLRequest(url: url)
         req.httpMethod = "PUT"
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
@@ -431,9 +439,9 @@ class NoteStore: ObservableObject {
         try? text.write(to: path, atomically: true, encoding: .utf8)
         datesWithNotes.insert(dc)
 
-        // Push the whole doc to Firebase. Single shared note — anyone can edit anywhere.
+        // Push the whole doc to Firebase, scoped by notebook.
         let dateKey = Self.fileFormatter.string(from: currentDate)
-        FirebaseDB.write(dateKey: dateKey, content: text)
+        FirebaseDB.write(notebook: currentNotebook, dateKey: dateKey, content: text)
     }
 
     func scheduleSave() {
@@ -473,9 +481,12 @@ class NoteStore: ObservableObject {
         if Date().timeIntervalSince(lastEditTime) < 2.0 { return }
 
         let dateKey = Self.fileFormatter.string(from: currentDate)
-        FirebaseDB.fetch(dateKey: dateKey) { [weak self] remote in
+        let notebook = currentNotebook
+        FirebaseDB.fetch(notebook: notebook, dateKey: dateKey) { [weak self] remote in
             DispatchQueue.main.async {
                 guard let self = self, let remote = remote else { return }
+                // Skip if the user switched notebooks during the network round-trip
+                guard self.currentNotebook == notebook else { return }
                 if self.saveTask != nil { return }
                 if Date().timeIntervalSince(self.lastEditTime) < 2.0 { return }
                 if remote == self.text { return }
@@ -614,6 +625,9 @@ class NoteStore: ObservableObject {
     /// Blank Ayush/Rohit template used for any new day's file.
     /// The Python sync daemon handles 4 AM carry-forward of unchecked tasks.
     func generateCarryForward(for date: Date) -> String {
+        // Only the Daily notebook uses the Ayush/Rohit template.
+        // Other notebooks start as blank documents.
+        guard currentNotebook == "Daily" else { return "" }
         return """
         ## Ayush
 
@@ -638,6 +652,8 @@ class NoteStore: ObservableObject {
     /// previous day into today's file. Runs once per logical day (tracked in
     /// UserDefaults). Safe to call repeatedly.
     func performCarryForwardIfNeeded() {
+        // Carry-forward (and the Ayush/Rohit template) only apply to the Daily notebook.
+        guard currentNotebook == "Daily" else { return }
         let today = Self.logicalToday()
         let todayKey = Self.fileFormatter.string(from: today)
         if UserDefaults.standard.string(forKey: "lastCarryForward") == todayKey { return }
@@ -691,7 +707,7 @@ class NoteStore: ObservableObject {
         UserDefaults.standard.set(todayKey, forKey: "lastCarryForward")
 
         // Push the carried-forward state to Firebase so the other Mac sees it too
-        FirebaseDB.write(dateKey: todayKey, content: todayText)
+        FirebaseDB.write(notebook: currentNotebook, dateKey: todayKey, content: todayText)
 
         // If we're currently viewing today, refresh the editor
         if Self.calendar.isDate(currentDate, inSameDayAs: today) {
