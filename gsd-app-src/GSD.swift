@@ -242,6 +242,49 @@ enum FirebaseDB {
         req.httpBody = try? JSONEncoder().encode(content)
         URLSession.shared.dataTask(with: req).resume()
     }
+
+    // MARK: Notebook list (shared across both Macs)
+
+    /// GET notebookList.json → ["Notebook A", "Notebook B", ...]
+    static func fetchNotebookList(completion: @escaping ([String]) -> Void) {
+        guard let url = URL(string: "\(baseURL)/notebookList.json") else {
+            completion([]); return
+        }
+        URLSession.shared.dataTask(with: url) { data, _, _ in
+            guard let data = data, data.count > 0 else { completion([]); return }
+            if let s = String(data: data, encoding: .utf8), s == "null" {
+                completion([]); return
+            }
+            // Stored as an object {name: true} for atomic adds without conflicts
+            if let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                completion(Array(obj.keys).sorted())
+            } else if let arr = try? JSONDecoder().decode([String].self, from: data) {
+                completion(arr.sorted())
+            } else {
+                completion([])
+            }
+        }.resume()
+    }
+
+    /// Register a notebook name so the other Mac will see it on next fetch.
+    static func registerNotebook(_ name: String) {
+        let nb = escapePath(name)
+        guard let url = URL(string: "\(baseURL)/notebookList/\(nb).json") else { return }
+        var req = URLRequest(url: url)
+        req.httpMethod = "PUT"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.httpBody = "true".data(using: .utf8)
+        URLSession.shared.dataTask(with: req).resume()
+    }
+
+    /// Remove a notebook name (when deleted).
+    static func unregisterNotebook(_ name: String) {
+        let nb = escapePath(name)
+        guard let url = URL(string: "\(baseURL)/notebookList/\(nb).json") else { return }
+        var req = URLRequest(url: url)
+        req.httpMethod = "DELETE"
+        URLSession.shared.dataTask(with: req).resume()
+    }
 }
 
 // MARK: - Note Storage
@@ -376,10 +419,11 @@ class NoteStore: ObservableObject {
     func createNotebook(name: String) {
         let dir = baseDir.appendingPathComponent(name)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        // Hidden marker so the directory has actual content — keeps iCloud from
-        // tidying up an "empty" notebook between syncs.
+        // Marker keeps the directory non-empty for any FS / iCloud tidy-up.
         let marker = dir.appendingPathComponent(".gsd-keep")
         try? Data("gsd".utf8).write(to: marker)
+        // Register in Firebase so the other Mac will see this notebook.
+        FirebaseDB.registerNotebook(name)
         notebooks = scanNotebooks()
         switchNotebook(to: name)
     }
@@ -388,9 +432,40 @@ class NoteStore: ObservableObject {
         guard name != "Daily" else { return }
         let dir = baseDir.appendingPathComponent(name)
         try? FileManager.default.removeItem(at: dir)
+        FirebaseDB.unregisterNotebook(name)
         notebooks = scanNotebooks()
         if currentNotebook == name {
             switchNotebook(to: "Daily")
+        }
+    }
+
+    /// Pull the remote notebook list from Firebase and reconcile with local
+    /// directories: any remote notebook we don't have locally gets a stub dir
+    /// so it shows up in the picker.
+    func syncNotebookListFromFirebase() {
+        FirebaseDB.fetchNotebookList { [weak self] remoteList in
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                let fm = FileManager.default
+                var changed = false
+                for name in remoteList where name != "Daily" {
+                    let dir = self.baseDir.appendingPathComponent(name)
+                    if !fm.fileExists(atPath: dir.path) {
+                        try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
+                        try? Data("gsd".utf8).write(to: dir.appendingPathComponent(".gsd-keep"))
+                        changed = true
+                    }
+                }
+                // Also register any LOCAL notebooks the remote doesn't know about yet
+                let local = self.scanNotebooks()
+                let remoteSet = Set(remoteList)
+                for name in local where name != "Daily" && !remoteSet.contains(name) {
+                    FirebaseDB.registerNotebook(name)
+                }
+                if changed {
+                    self.notebooks = self.scanNotebooks()
+                }
+            }
         }
     }
 
@@ -476,12 +551,14 @@ class NoteStore: ObservableObject {
     /// Start polling Firebase for changes to the current date.
     func startWatchingCurrentFile() {
         stopWatchingCurrentFile()
-        // Immediate fetch
+        // Immediate fetch + notebook list sync
         fetchFromFirebaseAndUpdate()
+        syncNotebookListFromFirebase()
         // Then every 2s while we're viewing this date
         firebasePollTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
             self?.fetchFromFirebaseAndUpdate()
             self?.performCarryForwardIfNeeded()
+            self?.syncNotebookListFromFirebase()
         }
     }
 
@@ -1577,12 +1654,14 @@ class MarkdownNSTextView: NSTextView {
         let line = ns.substring(with: lineRange).trimmingCharacters(in: .newlines)
         let trimmed = line.trimmingCharacters(in: .whitespaces)
 
-        // Checkbox continuation
-        if trimmed.hasPrefix("- [ ] ") || trimmed.hasPrefix("- [x] ")
-            || trimmed.hasPrefix("- [X] ")
-        {
-            let taskText = trimmed.count > 6
-                ? String(trimmed.dropFirst(6)).trimmingCharacters(in: .whitespaces) : ""
+        // Checkbox continuation — handle both "- [ ] foo" (text) and "- [ ]" (empty,
+        // since trimming removes the trailing space and we'd otherwise fall through
+        // to the bullet branch and inject a stray "- ").
+        let isCheckboxLine =
+            trimmed.hasPrefix("- [ ]") || trimmed.hasPrefix("- [x]") || trimmed.hasPrefix("- [X]")
+        if isCheckboxLine {
+            let taskText = trimmed.count > 5
+                ? String(trimmed.dropFirst(5)).trimmingCharacters(in: .whitespaces) : ""
             if taskText.isEmpty {
                 let prefixRange = (line as NSString).range(of: trimmed)
                 if prefixRange.location != NSNotFound {
