@@ -277,13 +277,15 @@ enum FirebaseDB {
         URLSession.shared.dataTask(with: req).resume()
     }
 
-    /// Remove a notebook name (when deleted).
+    /// Remove a notebook name AND all its day-content from Firebase.
     static func unregisterNotebook(_ name: String) {
         let nb = escapePath(name)
-        guard let url = URL(string: "\(baseURL)/notebookList/\(nb).json") else { return }
-        var req = URLRequest(url: url)
-        req.httpMethod = "DELETE"
-        URLSession.shared.dataTask(with: req).resume()
+        for path in ["notebookList/\(nb).json", "notebooks/\(nb).json"] {
+            guard let url = URL(string: "\(baseURL)/\(path)") else { continue }
+            var req = URLRequest(url: url)
+            req.httpMethod = "DELETE"
+            URLSession.shared.dataTask(with: req).resume()
+        }
     }
 }
 
@@ -960,6 +962,7 @@ struct NoteView: View {
     @State private var editingRaw = false
     @State private var showingNewNotebook = false
     @State private var newNotebookName = ""
+    @State private var showingDeleteConfirm = false
     @State private var searchMode = false
     @State private var searchQuery = ""
     @State private var launchAtLogin = LaunchAtLogin.isEnabled
@@ -983,6 +986,11 @@ struct NoteView: View {
                     Button("New Notebook...") {
                         newNotebookName = ""
                         showingNewNotebook = true
+                    }
+                    if store.currentNotebook != "Daily" {
+                        Button("Delete \"\(store.currentNotebook)\"...", role: .destructive) {
+                            showingDeleteConfirm = true
+                        }
                     }
                 } label: {
                     HStack(spacing: 4) {
@@ -1144,6 +1152,15 @@ struct NoteView: View {
                     store.createNotebook(name: name)
                 }
             )
+        }
+        .alert("Delete \"\(store.currentNotebook)\"?",
+               isPresented: $showingDeleteConfirm) {
+            Button("Cancel", role: .cancel) { }
+            Button("Delete", role: .destructive) {
+                store.deleteNotebook(name: store.currentNotebook)
+            }
+        } message: {
+            Text("This removes the notebook from both Macs. All notes inside it will be lost.")
         }
     }
 
