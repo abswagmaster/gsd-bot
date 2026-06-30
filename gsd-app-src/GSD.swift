@@ -430,14 +430,23 @@ class NoteStore: ObservableObject {
         switchNotebook(to: name)
     }
 
+    /// Notebooks we just deleted — the Firebase poll could otherwise re-create
+    /// them from a stale fetch before our DELETE propagates.
+    private var recentlyDeleted: Set<String> = []
+
     func deleteNotebook(name: String) {
         guard name != "Daily" else { return }
+        recentlyDeleted.insert(name)
         let dir = baseDir.appendingPathComponent(name)
         try? FileManager.default.removeItem(at: dir)
         FirebaseDB.unregisterNotebook(name)
         notebooks = scanNotebooks()
         if currentNotebook == name {
             switchNotebook(to: "Daily")
+        }
+        // Long enough for Firebase to fully propagate the delete.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 30) { [weak self] in
+            self?.recentlyDeleted.remove(name)
         }
     }
 
@@ -451,6 +460,8 @@ class NoteStore: ObservableObject {
                 let fm = FileManager.default
                 var changed = false
                 for name in remoteList where name != "Daily" {
+                    // Don't resurrect a notebook the user just deleted
+                    if self.recentlyDeleted.contains(name) { continue }
                     let dir = self.baseDir.appendingPathComponent(name)
                     if !fm.fileExists(atPath: dir.path) {
                         try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
@@ -458,10 +469,11 @@ class NoteStore: ObservableObject {
                         changed = true
                     }
                 }
-                // Also register any LOCAL notebooks the remote doesn't know about yet
                 let local = self.scanNotebooks()
                 let remoteSet = Set(remoteList)
-                for name in local where name != "Daily" && !remoteSet.contains(name) {
+                for name in local where
+                    name != "Daily" && !remoteSet.contains(name) && !self.recentlyDeleted.contains(name)
+                {
                     FirebaseDB.registerNotebook(name)
                 }
                 if changed {
