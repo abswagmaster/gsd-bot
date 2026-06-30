@@ -205,10 +205,12 @@ var gsdCurrentNotebook: String = "Daily"
 enum FirebaseDB {
     static let baseURL = "https://get-shit-done-ea870-default-rtdb.firebaseio.com"
 
-    /// Firebase path keys can't contain certain characters; escape them.
+    /// Firebase path keys can't contain certain characters; sanitize, then
+    /// percent-encode anything else (spaces etc) so the URL is always valid.
     private static func escapePath(_ raw: String) -> String {
         let bad: Set<Character> = [".", "#", "$", "[", "]", "/"]
-        return String(raw.map { bad.contains($0) ? "_" : $0 })
+        let cleaned = String(raw.map { bad.contains($0) ? "_" : $0 })
+        return cleaned.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? cleaned
     }
 
     /// GET notebooks/{notebook}/{date}/content.json → full markdown.
@@ -374,6 +376,10 @@ class NoteStore: ObservableObject {
     func createNotebook(name: String) {
         let dir = baseDir.appendingPathComponent(name)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        // Hidden marker so the directory has actual content — keeps iCloud from
+        // tidying up an "empty" notebook between syncs.
+        let marker = dir.appendingPathComponent(".gsd-keep")
+        try? Data("gsd".utf8).write(to: marker)
         notebooks = scanNotebooks()
         switchNotebook(to: name)
     }
@@ -439,9 +445,13 @@ class NoteStore: ObservableObject {
         if text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             text = generateCarryForward(for: currentDate)
         }
+        // Don't write empty files — iCloud cleans them up and the notebook
+        // ends up looking like it disappeared. Just leave any existing file alone.
+        if text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return
+        }
         lastSavedText = text
 
-        // Local file = cache for offline reads / debugging
         try? text.write(to: path, atomically: true, encoding: .utf8)
         datesWithNotes.insert(dc)
 
