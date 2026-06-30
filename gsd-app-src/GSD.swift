@@ -747,13 +747,17 @@ class NoteStore: ObservableObject {
     /// previous day into today's file. Runs once per logical day (tracked in
     /// UserDefaults). Safe to call repeatedly.
     func performCarryForwardIfNeeded() {
-        let today = Self.logicalToday()
+        // Daily uses the 4 AM logical-day boundary. Weekly goals uses real
+        // calendar midnight (so Sat → Sun rollover happens at 12:00 AM exactly,
+        // matching the user-set reset day).
+        let today = currentNotebook == "Weekly goals"
+            ? Self.calendar.startOfDay(for: Date())
+            : Self.logicalToday()
         let todayKey = Self.fileFormatter.string(from: today)
-        // Per-notebook tracker so Daily and Weekly goals each run once per day
         let trackerKey = "lastCarryForward_\(currentNotebook)"
         if UserDefaults.standard.string(forKey: trackerKey) == todayKey { return }
 
-        // Weekly goals notebook: Sunday is the reset day — start the week blank.
+        // Weekly goals: Sunday is the reset day — start the week blank.
         if currentNotebook == "Weekly goals" {
             let weekday = Self.calendar.component(.weekday, from: today)
             if weekday == 1 {
@@ -761,7 +765,6 @@ class NoteStore: ObservableObject {
                 return
             }
         } else if currentNotebook != "Daily" {
-            // No carry-forward for other arbitrary notebooks
             return
         }
 
