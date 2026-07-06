@@ -444,7 +444,13 @@ class NoteStore: ObservableObject {
         if currentNotebook == name {
             switchNotebook(to: "Daily")
         }
-        // Long enough for Firebase to fully propagate the delete.
+        // Retry a few times to defeat any race with a still-in-flight create/register
+        // request (URLSession tasks aren't guaranteed to complete in order).
+        for delay in [1.0, 3.0, 6.0] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+                FirebaseDB.unregisterNotebook(name)
+            }
+        }
         DispatchQueue.main.asyncAfter(deadline: .now() + 30) { [weak self] in
             self?.recentlyDeleted.remove(name)
         }
@@ -1004,7 +1010,10 @@ struct NoteView: View {
                     }
                     if store.currentNotebook != "Daily" {
                         Button("Delete \"\(store.currentNotebook)\"...", role: .destructive) {
-                            showingDeleteConfirm = true
+                            // Small delay so the Menu closes before the sheet opens
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                                showingDeleteConfirm = true
+                            }
                         }
                     }
                 } label: {
@@ -1168,14 +1177,15 @@ struct NoteView: View {
                 }
             )
         }
-        .alert("Delete \"\(store.currentNotebook)\"?",
-               isPresented: $showingDeleteConfirm) {
-            Button("Cancel", role: .cancel) { }
-            Button("Delete", role: .destructive) {
+        .confirmationDialog(
+            "Delete \"\(store.currentNotebook)\"? This can't be undone.",
+            isPresented: $showingDeleteConfirm,
+            titleVisibility: .visible
+        ) {
+            Button("Delete Notebook", role: .destructive) {
                 store.deleteNotebook(name: store.currentNotebook)
             }
-        } message: {
-            Text("This removes the notebook from both Macs. All notes inside it will be lost.")
+            Button("Cancel", role: .cancel) { }
         }
     }
 
