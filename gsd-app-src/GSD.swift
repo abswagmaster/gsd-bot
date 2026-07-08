@@ -245,45 +245,63 @@ enum FirebaseDB {
 
     // MARK: Notebook list (shared across both Macs)
 
-    /// GET notebookList.json → ["Notebook A", "Notebook B", ...]
-    static func fetchNotebookList(completion: @escaping ([String]) -> Void) {
-        guard let url = URL(string: "\(baseURL)/notebookList.json") else {
-            completion([]); return
+    private static func keysOfNode(_ data: Data?) -> [String] {
+        guard let data = data, data.count > 0 else { return [] }
+        if let s = String(data: data, encoding: .utf8), s == "null" { return [] }
+        if let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            return Array(obj.keys).sorted()
         }
-        URLSession.shared.dataTask(with: url) { data, _, _ in
-            guard let data = data, data.count > 0 else { completion([]); return }
-            if let s = String(data: data, encoding: .utf8), s == "null" {
-                completion([]); return
-            }
-            // Stored as an object {name: true} for atomic adds without conflicts
-            if let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-                completion(Array(obj.keys).sorted())
-            } else if let arr = try? JSONDecoder().decode([String].self, from: data) {
-                completion(arr.sorted())
-            } else {
-                completion([])
-            }
+        return []
+    }
+
+    /// GET the live notebook list AND the deleted-tombstone list.
+    static func fetchNotebookList(completion: @escaping ([String], Set<String>) -> Void) {
+        guard let liveURL = URL(string: "\(baseURL)/notebookList.json"),
+              let deadURL = URL(string: "\(baseURL)/deletedNotebooks.json") else {
+            completion([], []); return
+        }
+        URLSession.shared.dataTask(with: liveURL) { liveData, _, _ in
+            let live = keysOfNode(liveData)
+            URLSession.shared.dataTask(with: deadURL) { deadData, _, _ in
+                completion(live, Set(keysOfNode(deadData)))
+            }.resume()
         }.resume()
     }
 
     /// Register a notebook name so the other Mac will see it on next fetch.
+    /// Also clears any old tombstone so a re-created name comes back to life.
     static func registerNotebook(_ name: String) {
         let nb = escapePath(name)
-        guard let url = URL(string: "\(baseURL)/notebookList/\(nb).json") else { return }
-        var req = URLRequest(url: url)
-        req.httpMethod = "PUT"
-        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        req.httpBody = "true".data(using: .utf8)
-        URLSession.shared.dataTask(with: req).resume()
+        if let url = URL(string: "\(baseURL)/notebookList/\(nb).json") {
+            var req = URLRequest(url: url)
+            req.httpMethod = "PUT"
+            req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            req.httpBody = "true".data(using: .utf8)
+            URLSession.shared.dataTask(with: req).resume()
+        }
+        if let url = URL(string: "\(baseURL)/deletedNotebooks/\(nb).json") {
+            var req = URLRequest(url: url)
+            req.httpMethod = "DELETE"
+            URLSession.shared.dataTask(with: req).resume()
+        }
     }
 
-    /// Remove a notebook name AND all its day-content from Firebase.
+    /// Remove a notebook: drop it from the list, delete its content, and leave
+    /// a tombstone so the OTHER Mac deletes its local copy instead of
+    /// re-registering it (which is what used to resurrect deleted notebooks).
     static func unregisterNotebook(_ name: String) {
         let nb = escapePath(name)
         for path in ["notebookList/\(nb).json", "notebooks/\(nb).json"] {
             guard let url = URL(string: "\(baseURL)/\(path)") else { continue }
             var req = URLRequest(url: url)
             req.httpMethod = "DELETE"
+            URLSession.shared.dataTask(with: req).resume()
+        }
+        if let url = URL(string: "\(baseURL)/deletedNotebooks/\(nb).json") {
+            var req = URLRequest(url: url)
+            req.httpMethod = "PUT"
+            req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            req.httpBody = "true".data(using: .utf8)
             URLSession.shared.dataTask(with: req).resume()
         }
     }
@@ -460,14 +478,28 @@ class NoteStore: ObservableObject {
     /// directories: any remote notebook we don't have locally gets a stub dir
     /// so it shows up in the picker.
     func syncNotebookListFromFirebase() {
-        FirebaseDB.fetchNotebookList { [weak self] remoteList in
+        FirebaseDB.fetchNotebookList { [weak self] remoteList, tombstones in
             DispatchQueue.main.async {
                 guard let self = self else { return }
                 let fm = FileManager.default
                 var changed = false
+
+                // Tombstoned notebooks: delete our local copy too, so this Mac
+                // never re-registers a notebook the other Mac deleted.
+                for name in tombstones where name != "Daily" {
+                    let dir = self.baseDir.appendingPathComponent(name)
+                    if fm.fileExists(atPath: dir.path) {
+                        try? fm.removeItem(at: dir)
+                        changed = true
+                        if self.currentNotebook == name {
+                            self.switchNotebook(to: "Daily")
+                        }
+                    }
+                }
+
                 for name in remoteList where name != "Daily" {
-                    // Don't resurrect a notebook the user just deleted
                     if self.recentlyDeleted.contains(name) { continue }
+                    if tombstones.contains(name) { continue }
                     let dir = self.baseDir.appendingPathComponent(name)
                     if !fm.fileExists(atPath: dir.path) {
                         try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
@@ -478,7 +510,8 @@ class NoteStore: ObservableObject {
                 let local = self.scanNotebooks()
                 let remoteSet = Set(remoteList)
                 for name in local where
-                    name != "Daily" && !remoteSet.contains(name) && !self.recentlyDeleted.contains(name)
+                    name != "Daily" && !remoteSet.contains(name)
+                    && !self.recentlyDeleted.contains(name) && !tombstones.contains(name)
                 {
                     FirebaseDB.registerNotebook(name)
                 }
@@ -523,8 +556,23 @@ class NoteStore: ObservableObject {
         text.count
     }
 
+    /// Weekly goals keeps ONE file per week instead of one per day.
+    var isWeeklyNotebook: Bool { currentNotebook == "Weekly goals" }
+
+    /// The Sunday that starts the week containing `date`.
+    func weekStart(for date: Date) -> Date {
+        let comps = Self.calendar.dateComponents([.yearForWeekOfYear, .weekOfYear], from: date)
+        return Self.calendar.date(from: comps) ?? date
+    }
+
+    /// The date used for file names / Firebase keys — normalized to the
+    /// week's start for the Weekly goals notebook.
+    private func keyDate(for date: Date) -> Date {
+        isWeeklyNotebook ? weekStart(for: date) : date
+    }
+
     private func filePath(for date: Date) -> URL {
-        let name = Self.fileFormatter.string(from: date)
+        let name = Self.fileFormatter.string(from: keyDate(for: date))
         return storageDir.appendingPathComponent("\(name).md")
     }
 
@@ -551,7 +599,7 @@ class NoteStore: ObservableObject {
         datesWithNotes.insert(dc)
 
         // Push the whole doc to Firebase, scoped by notebook.
-        let dateKey = Self.fileFormatter.string(from: currentDate)
+        let dateKey = Self.fileFormatter.string(from: keyDate(for: currentDate))
         FirebaseDB.write(notebook: currentNotebook, dateKey: dateKey, content: text)
     }
 
@@ -593,7 +641,7 @@ class NoteStore: ObservableObject {
         if saveTask != nil { return }
         if Date().timeIntervalSince(lastEditTime) < 2.0 { return }
 
-        let dateKey = Self.fileFormatter.string(from: currentDate)
+        let dateKey = Self.fileFormatter.string(from: keyDate(for: currentDate))
         let notebook = currentNotebook
         FirebaseDB.fetch(notebook: notebook, dateKey: dateKey) { [weak self] remote in
             DispatchQueue.main.async {
@@ -632,13 +680,15 @@ class NoteStore: ObservableObject {
     }
 
     func goToPreviousDay() {
-        if let prev = Self.calendar.date(byAdding: .day, value: -1, to: currentDate) {
+        let step = isWeeklyNotebook ? -7 : -1
+        if let prev = Self.calendar.date(byAdding: .day, value: step, to: currentDate) {
             navigateTo(date: prev)
         }
     }
 
     func goToNextDay() {
-        if let next = Self.calendar.date(byAdding: .day, value: 1, to: currentDate) {
+        let step = isWeeklyNotebook ? 7 : 1
+        if let next = Self.calendar.date(byAdding: .day, value: step, to: currentDate) {
             navigateTo(date: next)
         }
     }
@@ -755,7 +805,12 @@ class NoteStore: ObservableObject {
 
             """
         case "Weekly goals":
-            return ""
+            return """
+            Ayush:
+
+            Rohit:
+
+            """
         default:
             return ""
         }
@@ -765,36 +820,19 @@ class NoteStore: ObservableObject {
     /// previous day into today's file. Runs once per logical day (tracked in
     /// UserDefaults). Safe to call repeatedly.
     func performCarryForwardIfNeeded() {
-        // Daily uses the 4 AM logical-day boundary. Weekly goals uses real
-        // calendar midnight (so Sat → Sun rollover happens at 12:00 AM exactly,
-        // matching the user-set reset day).
-        let today = currentNotebook == "Weekly goals"
-            ? Self.calendar.startOfDay(for: Date())
-            : Self.logicalToday()
+        // Only the Daily notebook carries tasks between files. Weekly goals is
+        // one file per week now — it persists all week and a new week simply
+        // starts a fresh file (with the Ayush:/Rohit: template) automatically.
+        guard currentNotebook == "Daily" else { return }
+        let today = Self.logicalToday()
         let todayKey = Self.fileFormatter.string(from: today)
         let trackerKey = "lastCarryForward_\(currentNotebook)"
         if UserDefaults.standard.string(forKey: trackerKey) == todayKey { return }
-
-        // Weekly goals: Sunday is the reset day — start the week blank.
-        if currentNotebook == "Weekly goals" {
-            let weekday = Self.calendar.component(.weekday, from: today)
-            if weekday == 1 {
-                UserDefaults.standard.set(todayKey, forKey: trackerKey)
-                return
-            }
-        } else if currentNotebook != "Daily" {
-            return
-        }
 
         // Find the most recent previous day's file (look back up to 30 days)
         var prevText = ""
         for back in 1...30 {
             guard let d = Self.calendar.date(byAdding: .day, value: -back, to: today) else { break }
-            // For Weekly goals, only carry within the same Sunday-Saturday week
-            if currentNotebook == "Weekly goals" {
-                let sameWeek = Self.calendar.isDate(today, equalTo: d, toGranularity: .weekOfYear)
-                if !sameWeek { break }
-            }
             let p = filePath(for: d)
             if let t = try? String(contentsOf: p, encoding: .utf8), !t.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 prevText = t
@@ -810,34 +848,16 @@ class NoteStore: ObservableObject {
         }
 
         if !prevText.isEmpty {
-            if currentNotebook == "Daily" {
-                let prevSecs = _gsdParseSections(prevText)
-                var carry: [String: [String]] = [:]
-                for (k, lines) in prevSecs {
-                    carry[k] = lines.filter {
-                        if _gsdTaskText($0) != nil, !_gsdIsChecked($0) { return true }
-                        return false
-                    }
+            let prevSecs = _gsdParseSections(prevText)
+            var carry: [String: [String]] = [:]
+            for (k, lines) in prevSecs {
+                carry[k] = lines.filter {
+                    if _gsdTaskText($0) != nil, !_gsdIsChecked($0) { return true }
+                    return false
                 }
-                let prevCarry = _gsdSerialize(carry)
-                todayText = mergeNotes(todayText, prevCarry)
-            } else {
-                // Weekly goals — flat list of unchecked checkboxes
-                let prevUnchecked = prevText.components(separatedBy: "\n").filter {
-                    _gsdTaskText($0) != nil && !_gsdIsChecked($0)
-                }
-                let todayUnchecked = todayText.components(separatedBy: "\n").filter {
-                    _gsdTaskText($0) != nil
-                }
-                let existing = Set(todayUnchecked.compactMap { _gsdTaskText($0)?.lowercased() })
-                var lines = todayUnchecked
-                for line in prevUnchecked {
-                    if let tt = _gsdTaskText(line), !existing.contains(tt.lowercased()) {
-                        lines.append(line)
-                    }
-                }
-                todayText = lines.joined(separator: "\n") + "\n"
             }
+            let prevCarry = _gsdSerialize(carry)
+            todayText = mergeNotes(todayText, prevCarry)
         }
 
         try? todayText.write(to: todayPath, atomically: true, encoding: .utf8)
@@ -1192,6 +1212,18 @@ struct NoteView: View {
     private func formattedDate() -> String {
         let cal = Calendar.current
         let date = store.currentDate
+
+        // Weekly goals shows the week, not the day.
+        if store.isWeeklyNotebook {
+            let start = store.weekStart(for: date)
+            let f = DateFormatter()
+            if cal.component(.year, from: start) == cal.component(.year, from: Date()) {
+                f.dateFormat = "MMMM d"
+            } else {
+                f.dateFormat = "MMMM d, yyyy"
+            }
+            return "Week of \(f.string(from: start))"
+        }
 
         if cal.isDateInToday(date) { return "Today" }
         if cal.isDateInYesterday(date) { return "Yesterday" }
