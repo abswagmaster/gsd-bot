@@ -213,21 +213,26 @@ enum FirebaseDB {
         return cleaned.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? cleaned
     }
 
-    /// GET notebooks/{notebook}/{date}/content.json → full markdown.
-    static func fetch(notebook: String, dateKey: String, completion: @escaping (String?) -> Void) {
+    /// GET notebooks/{notebook}/{date}/content.json → (content, success).
+    /// success=true with content=nil means the server confirmed there is no
+    /// note for that date (as opposed to a network error, where success=false).
+    static func fetch(notebook: String, dateKey: String, completion: @escaping (String?, Bool) -> Void) {
         let nb = escapePath(notebook)
         guard let url = URL(string: "\(baseURL)/notebooks/\(nb)/\(dateKey)/content.json") else {
-            completion(nil); return
+            completion(nil, false); return
         }
-        URLSession.shared.dataTask(with: url) { data, _, _ in
-            guard let data = data else { completion(nil); return }
-            if data.count == 4, String(data: data, encoding: .utf8) == "null" {
-                completion(nil); return
+        URLSession.shared.dataTask(with: url) { data, response, _ in
+            guard let data = data,
+                  let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+                completion(nil, false); return
+            }
+            if String(data: data, encoding: .utf8) == "null" {
+                completion(nil, true); return
             }
             if let s = try? JSONDecoder().decode(String.self, from: data) {
-                completion(s)
+                completion(s, true)
             } else {
-                completion(nil)
+                completion(nil, false)
             }
         }.resume()
     }
@@ -373,7 +378,8 @@ class NoteStore: ObservableObject {
         let loaded = loadFile(for: currentDate)
         if loaded.isEmpty {
             text = generateCarryForward(for: currentDate)
-            if !text.isEmpty { scheduleSave() }
+            // Deliberately NOT saved/pushed here — the first Firebase fetch
+            // decides whether remote content replaces this or we seed remote.
         } else {
             text = loaded
         }
@@ -426,7 +432,8 @@ class NoteStore: ObservableObject {
         let loaded = loadFile(for: currentDate)
         if loaded.isEmpty {
             text = generateCarryForward(for: currentDate)
-            if !text.isEmpty { scheduleSave() }
+            // Deliberately NOT saved/pushed here — the first Firebase fetch
+            // decides whether remote content replaces this or we seed remote.
         } else {
             text = loaded
         }
@@ -616,9 +623,16 @@ class NoteStore: ObservableObject {
 
     // MARK: - Firebase live sync (replaces file watching)
 
+    /// True once we've heard back from Firebase for the currently-viewed note.
+    /// Nothing (carry-forward, seeding) is allowed to PUSH until this is set —
+    /// pushing before the first fetch is what used to overwrite the other
+    /// person's edits whenever the app opened with stale local files.
+    private var didInitialFetch = false
+
     /// Start polling Firebase for changes to the current date.
     func startWatchingCurrentFile() {
         stopWatchingCurrentFile()
+        didInitialFetch = false
         // Immediate fetch + notebook list sync
         fetchFromFirebaseAndUpdate()
         syncNotebookListFromFirebase()
@@ -635,19 +649,36 @@ class NoteStore: ObservableObject {
         firebasePollTimer = nil
     }
 
-    /// Pull latest from Firebase. If the user is idle and the assembled
-    /// remote text differs from what's showing, update.
+    /// Pull latest from Firebase. Remote is the source of truth: if the server
+    /// has content, it replaces what we loaded from disk. Only when the server
+    /// confirms it has NOTHING for this date do we seed it with our local text.
     private func fetchFromFirebaseAndUpdate() {
         if saveTask != nil { return }
         if Date().timeIntervalSince(lastEditTime) < 2.0 { return }
 
         let dateKey = Self.fileFormatter.string(from: keyDate(for: currentDate))
         let notebook = currentNotebook
-        FirebaseDB.fetch(notebook: notebook, dateKey: dateKey) { [weak self] remote in
+        FirebaseDB.fetch(notebook: notebook, dateKey: dateKey) { [weak self] remote, ok in
             DispatchQueue.main.async {
-                guard let self = self, let remote = remote else { return }
-                // Skip if the user switched notebooks during the network round-trip
-                guard self.currentNotebook == notebook else { return }
+                guard let self = self, ok else { return }
+                // Skip if the user switched notebooks/dates during the round-trip
+                guard self.currentNotebook == notebook,
+                      Self.fileFormatter.string(from: self.keyDate(for: self.currentDate)) == dateKey
+                else { return }
+
+                guard let remote = remote else {
+                    // Server confirmed: nothing stored for this date. Seed it
+                    // with whatever we're showing (template or local file).
+                    if !self.didInitialFetch,
+                       !self.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        FirebaseDB.write(notebook: notebook, dateKey: dateKey, content: self.text)
+                        self.lastSavedText = self.text
+                    }
+                    self.didInitialFetch = true
+                    return
+                }
+
+                self.didInitialFetch = true
                 if self.saveTask != nil { return }
                 if Date().timeIntervalSince(self.lastEditTime) < 2.0 { return }
                 if remote == self.text { return }
@@ -671,7 +702,8 @@ class NoteStore: ObservableObject {
         let loaded = loadFile(for: date)
         if loaded.isEmpty {
             text = generateCarryForward(for: date)
-            if !text.isEmpty { scheduleSave() }
+            // Deliberately NOT saved/pushed here — the first Firebase fetch
+            // decides whether remote content replaces this or we seed remote.
         } else {
             text = loaded
         }
@@ -824,6 +856,10 @@ class NoteStore: ObservableObject {
         // one file per week now — it persists all week and a new week simply
         // starts a fresh file (with the Ayush:/Rohit: template) automatically.
         guard currentNotebook == "Daily" else { return }
+        // Never run before the first fetch has synced today's remote state —
+        // otherwise we'd merge from stale local files and push over the other
+        // person's newer edits.
+        guard didInitialFetch else { return }
         let today = Self.logicalToday()
         let todayKey = Self.fileFormatter.string(from: today)
         let trackerKey = "lastCarryForward_\(currentNotebook)"
