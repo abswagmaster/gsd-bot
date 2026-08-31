@@ -31,6 +31,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var popover: NSPopover!
     var eventMonitor: Any?
     var hotKeyManager = HotKeyManager()
+    var timeAuditTimer: Timer?
     private var cancellables = Set<AnyCancellable>()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -71,6 +72,55 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         ) { [weak self] in
             self?.togglePopover()
         }
+
+        scheduleTimeAudit()
+    }
+
+    // MARK: - Hourly time audit (two-week window)
+
+    func scheduleTimeAudit() {
+        // Start the two-week window the first time this build launches.
+        let d = UserDefaults.standard
+        if d.object(forKey: "timeAuditUntil") == nil {
+            d.set(Date().addingTimeInterval(14 * 86400), forKey: "timeAuditUntil")
+        }
+        // Fire at the next top of the hour, then every hour after.
+        guard let next = Calendar.current.nextDate(
+            after: Date(), matching: DateComponents(minute: 0), matchingPolicy: .nextTime)
+        else { return }
+        let t = Timer(fire: next, interval: 3600, repeats: true) { [weak self] _ in
+            self?.showTimeAuditPrompt()
+        }
+        t.tolerance = 30
+        RunLoop.main.add(t, forMode: .common)
+        timeAuditTimer = t
+    }
+
+    func showTimeAuditPrompt() {
+        if let until = UserDefaults.standard.object(forKey: "timeAuditUntil") as? Date,
+           Date() > until {
+            timeAuditTimer?.invalidate()
+            timeAuditTimer = nil
+            return
+        }
+        NSApp.activate(ignoringOtherApps: true)
+        let hourFmt = DateFormatter()
+        hourFmt.dateFormat = "h a"
+        let hourAgo = Date().addingTimeInterval(-3600)
+
+        let alert = NSAlert()
+        alert.messageText = "Time audit"
+        alert.informativeText =
+            "What did you do from \(hourFmt.string(from: hourAgo)) to \(hourFmt.string(from: Date()))?"
+        let input = NSTextField(frame: NSRect(x: 0, y: 0, width: 280, height: 24))
+        alert.accessoryView = input
+        alert.addButton(withTitle: "Log")
+        alert.addButton(withTitle: "Skip")
+        alert.window.initialFirstResponder = input
+        if alert.runModal() == .alertFirstButtonReturn {
+            let entry = input.stringValue.trimmingCharacters(in: .whitespaces)
+            if !entry.isEmpty { TimeAudit.append(entry) }
+        }
     }
 
     @objc func togglePopover() {
@@ -83,6 +133,32 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             NSApp.activate(ignoringOtherApps: true)
             popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
             popover.contentViewController?.view.window?.makeKey()
+        }
+    }
+}
+
+// MARK: - Time Audit log
+
+enum TimeAudit {
+    /// Appends one entry to ~/.gsd/Time Audit/YYYY-MM-DD.md.
+    /// Device-local by design — each person's audit is their own.
+    static func append(_ entry: String) {
+        let dir = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".gsd/Time Audit")
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let dayFmt = DateFormatter()
+        dayFmt.dateFormat = "yyyy-MM-dd"
+        let file = dir.appendingPathComponent("\(dayFmt.string(from: Date())).md")
+        let timeFmt = DateFormatter()
+        timeFmt.dateFormat = "HH:mm"
+        let hourAgo = Date().addingTimeInterval(-3600)
+        let line = "- \(timeFmt.string(from: hourAgo))–\(timeFmt.string(from: Date())): \(entry)\n"
+        if let handle = try? FileHandle(forWritingTo: file) {
+            handle.seekToEndOfFile()
+            handle.write(Data(line.utf8))
+            try? handle.close()
+        } else {
+            try? line.write(to: file, atomically: true, encoding: .utf8)
         }
     }
 }
@@ -517,7 +593,7 @@ class NoteStore: ObservableObject {
                 let local = self.scanNotebooks()
                 let remoteSet = Set(remoteList)
                 for name in local where
-                    name != "Daily" && !remoteSet.contains(name)
+                    name != "Daily" && name != "Time Audit" && !remoteSet.contains(name)
                     && !self.recentlyDeleted.contains(name) && !tombstones.contains(name)
                 {
                     FirebaseDB.registerNotebook(name)
@@ -606,6 +682,8 @@ class NoteStore: ObservableObject {
         datesWithNotes.insert(dc)
 
         // Push the whole doc to Firebase, scoped by notebook.
+        // Time Audit is device-local: each person keeps their own log.
+        guard currentNotebook != "Time Audit" else { return }
         let dateKey = Self.fileFormatter.string(from: keyDate(for: currentDate))
         FirebaseDB.write(notebook: currentNotebook, dateKey: dateKey, content: text)
     }
@@ -655,6 +733,8 @@ class NoteStore: ObservableObject {
     private func fetchFromFirebaseAndUpdate() {
         if saveTask != nil { return }
         if Date().timeIntervalSince(lastEditTime) < 2.0 { return }
+        // Time Audit never syncs — it's a per-device personal log.
+        if currentNotebook == "Time Audit" { didInitialFetch = true; return }
 
         let dateKey = Self.fileFormatter.string(from: keyDate(for: currentDate))
         let notebook = currentNotebook
