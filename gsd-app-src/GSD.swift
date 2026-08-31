@@ -140,26 +140,30 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 // MARK: - Time Audit log
 
 enum TimeAudit {
-    /// Appends one entry to ~/.gsd/Time Audit/YYYY-MM-DD.md.
-    /// Device-local by design — each person's audit is their own.
+    /// Which audit notebook this Mac writes to, keyed by macOS username.
+    /// Both notebooks sync through Firebase, so each person can read the other's.
+    static var notebookName: String {
+        NSUserName() == "abswag" ? "Ayush Audit" : "Rohit Audit"
+    }
+
+    /// Appends one entry to ~/.gsd/<X Audit>/YYYY-MM-DD.md and pushes the
+    /// day's full log to Firebase.
     static func append(_ entry: String) {
         let dir = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".gsd/Time Audit")
+            .appendingPathComponent(".gsd/\(notebookName)")
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         let dayFmt = DateFormatter()
         dayFmt.dateFormat = "yyyy-MM-dd"
-        let file = dir.appendingPathComponent("\(dayFmt.string(from: Date())).md")
+        let dayKey = dayFmt.string(from: Date())
+        let file = dir.appendingPathComponent("\(dayKey).md")
         let timeFmt = DateFormatter()
         timeFmt.dateFormat = "HH:mm"
         let hourAgo = Date().addingTimeInterval(-3600)
         let line = "- \(timeFmt.string(from: hourAgo))–\(timeFmt.string(from: Date())): \(entry)\n"
-        if let handle = try? FileHandle(forWritingTo: file) {
-            handle.seekToEndOfFile()
-            handle.write(Data(line.utf8))
-            try? handle.close()
-        } else {
-            try? line.write(to: file, atomically: true, encoding: .utf8)
-        }
+        let existing = (try? String(contentsOf: file, encoding: .utf8)) ?? ""
+        let updated = existing + line
+        try? updated.write(to: file, atomically: true, encoding: .utf8)
+        FirebaseDB.write(notebook: notebookName, dateKey: dayKey, content: updated)
     }
 }
 
@@ -593,7 +597,7 @@ class NoteStore: ObservableObject {
                 let local = self.scanNotebooks()
                 let remoteSet = Set(remoteList)
                 for name in local where
-                    name != "Daily" && name != "Time Audit" && !remoteSet.contains(name)
+                    name != "Daily" && !remoteSet.contains(name)
                     && !self.recentlyDeleted.contains(name) && !tombstones.contains(name)
                 {
                     FirebaseDB.registerNotebook(name)
@@ -682,8 +686,6 @@ class NoteStore: ObservableObject {
         datesWithNotes.insert(dc)
 
         // Push the whole doc to Firebase, scoped by notebook.
-        // Time Audit is device-local: each person keeps their own log.
-        guard currentNotebook != "Time Audit" else { return }
         let dateKey = Self.fileFormatter.string(from: keyDate(for: currentDate))
         FirebaseDB.write(notebook: currentNotebook, dateKey: dateKey, content: text)
     }
@@ -733,9 +735,6 @@ class NoteStore: ObservableObject {
     private func fetchFromFirebaseAndUpdate() {
         if saveTask != nil { return }
         if Date().timeIntervalSince(lastEditTime) < 2.0 { return }
-        // Time Audit never syncs — it's a per-device personal log.
-        if currentNotebook == "Time Audit" { didInitialFetch = true; return }
-
         let dateKey = Self.fileFormatter.string(from: keyDate(for: currentDate))
         let notebook = currentNotebook
         FirebaseDB.fetch(notebook: notebook, dateKey: dateKey) { [weak self] remote, ok in
