@@ -111,16 +111,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let alert = NSAlert()
         alert.messageText = "Time audit"
         alert.informativeText =
-            "What did you do from \(hourFmt.string(from: hourAgo)) to \(hourFmt.string(from: Date()))?"
-        let input = NSTextField(frame: NSRect(x: 0, y: 0, width: 280, height: 24))
-        alert.accessoryView = input
-        alert.addButton(withTitle: "Log")
-        alert.addButton(withTitle: "Skip")
-        alert.window.initialFirstResponder = input
-        if alert.runModal() == .alertFirstButtonReturn {
-            let entry = input.stringValue.trimmingCharacters(in: .whitespaces)
-            if !entry.isEmpty { TimeAudit.append(entry) }
-        }
+            "Log what you did from \(hourFmt.string(from: hourAgo)) to \(hourFmt.string(from: Date())) in the Google Sheet."
+        alert.addButton(withTitle: "OK")
+        alert.runModal()
     }
 
     @objc func togglePopover() {
@@ -134,36 +127,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
             popover.contentViewController?.view.window?.makeKey()
         }
-    }
-}
-
-// MARK: - Time Audit log
-
-enum TimeAudit {
-    /// Which audit notebook this Mac writes to, keyed by macOS username.
-    /// Both notebooks sync through Firebase, so each person can read the other's.
-    static var notebookName: String {
-        NSUserName() == "abswag" ? "Ayush Audit" : "Rohit Audit"
-    }
-
-    /// Appends one entry to ~/.gsd/<X Audit>/YYYY-MM-DD.md and pushes the
-    /// day's full log to Firebase.
-    static func append(_ entry: String) {
-        let dir = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".gsd/\(notebookName)")
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        let dayFmt = DateFormatter()
-        dayFmt.dateFormat = "yyyy-MM-dd"
-        let dayKey = dayFmt.string(from: Date())
-        let file = dir.appendingPathComponent("\(dayKey).md")
-        let timeFmt = DateFormatter()
-        timeFmt.dateFormat = "HH:mm"
-        let hourAgo = Date().addingTimeInterval(-3600)
-        let line = "- \(timeFmt.string(from: hourAgo))–\(timeFmt.string(from: Date())): \(entry)\n"
-        let existing = (try? String(contentsOf: file, encoding: .utf8)) ?? ""
-        let updated = existing + line
-        try? updated.write(to: file, atomically: true, encoding: .utf8)
-        FirebaseDB.write(notebook: notebookName, dateKey: dayKey, content: updated)
     }
 }
 
