@@ -84,34 +84,49 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         if d.object(forKey: "timeAuditUntil") == nil {
             d.set(Date().addingTimeInterval(14 * 86400), forKey: "timeAuditUntil")
         }
-        // Fire at the next top of the hour, then every hour after.
-        guard let next = Calendar.current.nextDate(
-            after: Date(), matching: DateComponents(minute: 0), matchingPolicy: .nextTime)
-        else { return }
-        let t = Timer(fire: next, interval: 3600, repeats: true) { [weak self] _ in
-            self?.showTimeAuditPrompt()
+        // A single hour-long Timer drifts: macOS suspends timers during sleep
+        // and delivers missed fires late (e.g. 3:27), which also skewed the
+        // "past hour" label. Instead, check the wall clock every 30s and ping
+        // only at the top of an hour — a ping missed while asleep is skipped,
+        // never delivered at a random time.
+        let t = Timer(timeInterval: 30, repeats: true) { [weak self] _ in
+            self?.timeAuditTick()
         }
-        t.tolerance = 30
+        t.tolerance = 5
         RunLoop.main.add(t, forMode: .common)
         timeAuditTimer = t
     }
 
-    func showTimeAuditPrompt() {
-        if let until = UserDefaults.standard.object(forKey: "timeAuditUntil") as? Date,
-           Date() > until {
+    private func timeAuditTick() {
+        let d = UserDefaults.standard
+        if let until = d.object(forKey: "timeAuditUntil") as? Date, Date() > until {
             timeAuditTimer?.invalidate()
             timeAuditTimer = nil
             return
         }
+        let now = Date()
+        // Only within the first 2 minutes of an hour — otherwise skip.
+        guard Calendar.current.component(.minute, from: now) < 2 else { return }
+        // Once per hour, even across relaunches.
+        let stampFmt = DateFormatter()
+        stampFmt.dateFormat = "yyyy-MM-dd-HH"
+        let stamp = stampFmt.string(from: now)
+        guard d.string(forKey: "timeAuditLastPing") != stamp else { return }
+        d.set(stamp, forKey: "timeAuditLastPing")
+        showTimeAuditPrompt()
+    }
+
+    func showTimeAuditPrompt() {
         NSApp.activate(ignoringOtherApps: true)
+        // Label from the actual hour boundary, not "now minus 3600s", so a
+        // ping at 4:00:41 still reads "3 PM to 4 PM".
+        let hourStart = Calendar.current.dateInterval(of: .hour, for: Date())?.start ?? Date()
         let hourFmt = DateFormatter()
         hourFmt.dateFormat = "h a"
-        let hourAgo = Date().addingTimeInterval(-3600)
-
         let alert = NSAlert()
         alert.messageText = "Time audit"
         alert.informativeText =
-            "Log what you did from \(hourFmt.string(from: hourAgo)) to \(hourFmt.string(from: Date())) in the Google Sheet."
+            "Log what you did from \(hourFmt.string(from: hourStart.addingTimeInterval(-3600))) to \(hourFmt.string(from: hourStart)) in the Google Sheet."
         alert.addButton(withTitle: "OK")
         alert.runModal()
     }
