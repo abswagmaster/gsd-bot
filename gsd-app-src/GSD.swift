@@ -249,6 +249,30 @@ enum FirebaseDB {
         URLSession.shared.dataTask(with: req).resume()
     }
 
+    // MARK: Simple shared flags
+
+    /// GET a boolean flag node. completion(isSet, requestSucceeded).
+    static func getFlag(_ path: String, completion: @escaping (Bool, Bool) -> Void) {
+        guard let url = URL(string: "\(baseURL)/\(path).json") else { completion(false, false); return }
+        URLSession.shared.dataTask(with: url) { data, response, _ in
+            guard let data = data,
+                  let http = response as? HTTPURLResponse, http.statusCode == 200,
+                  let s = String(data: data, encoding: .utf8) else {
+                completion(false, false); return
+            }
+            completion(s == "true", true)
+        }.resume()
+    }
+
+    static func setFlag(_ path: String) {
+        guard let url = URL(string: "\(baseURL)/\(path).json") else { return }
+        var req = URLRequest(url: url)
+        req.httpMethod = "PUT"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.httpBody = "true".data(using: .utf8)
+        URLSession.shared.dataTask(with: req).resume()
+    }
+
     // MARK: Notebook list (shared across both Macs)
 
     private static func keysOfNode(_ data: Data?) -> [String] {
@@ -606,7 +630,10 @@ class NoteStore: ObservableObject {
         try? text.write(to: path, atomically: true, encoding: .utf8)
         datesWithNotes.insert(dc)
 
-        // Push the whole doc to Firebase, scoped by notebook.
+        // Push the whole doc to Firebase — but NEVER before the first fetch
+        // for this view has landed. Until then our text may just be a stale
+        // local file, and pushing it would erase the other person's edits.
+        guard didInitialFetch else { return }
         let dateKey = Self.fileFormatter.string(from: keyDate(for: currentDate))
         FirebaseDB.write(notebook: currentNotebook, dateKey: dateKey, content: text)
     }
@@ -865,6 +892,25 @@ class NoteStore: ObservableObject {
         let trackerKey = "lastCarryForward_\(currentNotebook)"
         if UserDefaults.standard.string(forKey: trackerKey) == todayKey { return }
 
+        // Carry-forward must run once per day GLOBALLY, not once per Mac.
+        // Without this, the second person to open GSD each day would merge
+        // THEIR stale yesterday-file into the already-groomed shared list —
+        // resurrecting deleted tasks and erasing the first person's edits.
+        FirebaseDB.getFlag("carryDone/\(todayKey)") { [weak self] alreadyDone, ok in
+            DispatchQueue.main.async {
+                guard let self = self, ok, self.currentNotebook == "Daily" else { return }
+                if alreadyDone {
+                    UserDefaults.standard.set(todayKey, forKey: trackerKey)
+                    return
+                }
+                guard UserDefaults.standard.string(forKey: trackerKey) != todayKey else { return }
+                FirebaseDB.setFlag("carryDone/\(todayKey)")
+                self.runDailyCarryForward(today: today, todayKey: todayKey, trackerKey: trackerKey)
+            }
+        }
+    }
+
+    private func runDailyCarryForward(today: Date, todayKey: String, trackerKey: String) {
         // Find the most recent previous day's file (look back up to 30 days)
         var prevText = ""
         for back in 1...30 {
