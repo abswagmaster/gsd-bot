@@ -72,6 +72,23 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             self?.togglePopover()
         }
 
+        reportBuildBeacon()
+    }
+
+    /// Report which build this Mac is running so sync bugs can be diagnosed:
+    ///   curl .../clients.json  →  {"abswag": {...}, "rohitrajuladevi": {...}}
+    private func reportBuildBeacon() {
+        let buildStamp = "2026-10-27"
+        guard let url = URL(string: "\(FirebaseDB.baseURL)/clients/\(NSUserName()).json") else { return }
+        var req = URLRequest(url: url)
+        req.httpMethod = "PUT"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        let payload: [String: String] = [
+            "build": buildStamp,
+            "launched": ISO8601DateFormatter().string(from: Date()),
+        ]
+        req.httpBody = try? JSONSerialization.data(withJSONObject: payload)
+        URLSession.shared.dataTask(with: req).resume()
     }
 
     @objc func togglePopover() {
@@ -631,9 +648,10 @@ class NoteStore: ObservableObject {
         datesWithNotes.insert(dc)
 
         // Push the whole doc to Firebase — but NEVER before the first fetch
-        // for this view has landed. Until then our text may just be a stale
-        // local file, and pushing it would erase the other person's edits.
-        guard didInitialFetch else { return }
+        // for this view has landed, and never when connectivity has gone stale
+        // (sleep/wake, network drop): stale pushes erase the other person's
+        // edits. The poll refreshes lastFetchOK every ~2s while healthy.
+        guard didInitialFetch, Date().timeIntervalSince(lastFetchOK) < 10 else { return }
         let dateKey = Self.fileFormatter.string(from: keyDate(for: currentDate))
         FirebaseDB.write(notebook: currentNotebook, dateKey: dateKey, content: text)
     }
@@ -656,11 +674,16 @@ class NoteStore: ObservableObject {
     /// pushing before the first fetch is what used to overwrite the other
     /// person's edits whenever the app opened with stale local files.
     private var didInitialFetch = false
+    /// Time of the last successful Firebase round-trip for the current view.
+    /// save() refuses to push when this is stale (e.g. right after waking from
+    /// sleep), so hours-old text can't overwrite the other person's edits.
+    private var lastFetchOK = Date.distantPast
 
     /// Start polling Firebase for changes to the current date.
     func startWatchingCurrentFile() {
         stopWatchingCurrentFile()
         didInitialFetch = false
+        lastFetchOK = .distantPast
         // Immediate fetch + notebook list sync
         fetchFromFirebaseAndUpdate()
         syncNotebookListFromFirebase()
@@ -680,9 +703,9 @@ class NoteStore: ObservableObject {
     /// Pull latest from Firebase. Remote is the source of truth: if the server
     /// has content, it replaces what we loaded from disk. Only when the server
     /// confirms it has NOTHING for this date do we seed it with our local text.
+    /// Always runs (even mid-typing) so connectivity freshness stays current;
+    /// the callback refuses to touch `text` while the user is editing.
     private func fetchFromFirebaseAndUpdate() {
-        if saveTask != nil { return }
-        if Date().timeIntervalSince(lastEditTime) < 2.0 { return }
         let dateKey = Self.fileFormatter.string(from: keyDate(for: currentDate))
         let notebook = currentNotebook
         FirebaseDB.fetch(notebook: notebook, dateKey: dateKey) { [weak self] remote, ok in
@@ -692,11 +715,17 @@ class NoteStore: ObservableObject {
                 guard self.currentNotebook == notebook,
                       Self.fileFormatter.string(from: self.keyDate(for: self.currentDate)) == dateKey
                 else { return }
+                self.lastFetchOK = Date()
 
                 guard let remote = remote else {
-                    // Server confirmed: nothing stored for this date. Seed it
-                    // with whatever we're showing (template or local file).
-                    if !self.didInitialFetch,
+                    // Server confirmed: nothing stored for this date.
+                    // Daily-today is NEVER seeded here — carry-forward is the
+                    // only thing allowed to create today, otherwise the seeded
+                    // template makes the day look "already started" and the
+                    // carry-forward from yesterday gets skipped.
+                    let todayKey = Self.fileFormatter.string(from: Self.logicalToday())
+                    let isDailyToday = notebook == "Daily" && dateKey == todayKey
+                    if !self.didInitialFetch, !isDailyToday,
                        !self.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                         FirebaseDB.write(notebook: notebook, dateKey: dateKey, content: self.text)
                         self.lastSavedText = self.text
@@ -904,54 +933,95 @@ class NoteStore: ObservableObject {
                     return
                 }
                 guard UserDefaults.standard.string(forKey: trackerKey) != todayKey else { return }
-                FirebaseDB.setFlag("carryDone/\(todayKey)")
                 self.runDailyCarryForward(today: today, todayKey: todayKey, trackerKey: trackerKey)
             }
         }
     }
 
+    /// Builds today from REMOTE data only. Local files on a Mac that hasn't
+    /// been opened in days are stale — carrying forward from them resurrects
+    /// tasks the other person already finished and erases their edits.
     private func runDailyCarryForward(today: Date, todayKey: String, trackerKey: String) {
-        // Find the most recent previous day's file (look back up to 30 days)
-        var prevText = ""
-        for back in 1...30 {
-            guard let d = Self.calendar.date(byAdding: .day, value: -back, to: today) else { break }
-            let p = filePath(for: d)
-            if let t = try? String(contentsOf: p, encoding: .utf8), !t.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                prevText = t
-                break
-            }
-        }
+        // 1. What does the server have for today?
+        FirebaseDB.fetch(notebook: "Daily", dateKey: todayKey) { [weak self] remoteToday, ok in
+            DispatchQueue.main.async {
+                guard let self = self, ok, self.currentNotebook == "Daily" else { return }
 
-        // Today's file (or a fresh blank template)
-        let todayPath = filePath(for: today)
-        var todayText = (try? String(contentsOf: todayPath, encoding: .utf8)) ?? ""
-        if todayText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            todayText = generateCarryForward(for: today)
-        }
+                // Day already has real tasks (not just a template) → someone
+                // already started it. Adopt it, mark done, never rewrite.
+                if let remoteToday = remoteToday, _gsdHasTasks(remoteToday) {
+                    FirebaseDB.setFlag("carryDone/\(todayKey)")
+                    UserDefaults.standard.set(todayKey, forKey: trackerKey)
+                    try? remoteToday.write(to: self.filePath(for: today), atomically: true, encoding: .utf8)
+                    if Self.calendar.isDate(self.currentDate, inSameDayAs: today),
+                       self.saveTask == nil,
+                       Date().timeIntervalSince(self.lastEditTime) >= 2.0 {
+                        self.text = remoteToday
+                        self.lastSavedText = remoteToday
+                    }
+                    return
+                }
 
-        if !prevText.isEmpty {
-            let prevSecs = _gsdParseSections(prevText)
-            var carry: [String: [String]] = [:]
-            for (k, lines) in prevSecs {
-                carry[k] = lines.filter {
-                    if _gsdTaskText($0) != nil, !_gsdIsChecked($0) { return true }
-                    return false
+                // 2. Fetch the most recent previous day FROM THE SERVER.
+                self.fetchMostRecentRemoteDay(before: today, back: 1) { prevText, walkOK in
+                    guard walkOK, self.currentNotebook == "Daily" else { return }
+
+                    var todayText = remoteToday ?? self.generateCarryForward(for: today)
+                    if todayText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        todayText = self.generateCarryForward(for: today)
+                    }
+                    if let prevText = prevText {
+                        let prevSecs = _gsdParseSections(prevText)
+                        var carry: [String: [String]] = [:]
+                        for (k, lines) in prevSecs {
+                            carry[k] = lines.filter {
+                                if _gsdTaskText($0) != nil, !_gsdIsChecked($0) { return true }
+                                return false
+                            }
+                        }
+                        todayText = mergeNotes(todayText, _gsdSerialize(carry))
+                    }
+
+                    try? todayText.write(to: self.filePath(for: today), atomically: true, encoding: .utf8)
+                    UserDefaults.standard.set(todayKey, forKey: trackerKey)
+                    FirebaseDB.write(notebook: "Daily", dateKey: todayKey, content: todayText)
+                    FirebaseDB.setFlag("carryDone/\(todayKey)")
+
+                    if Self.calendar.isDate(self.currentDate, inSameDayAs: today),
+                       self.saveTask == nil,
+                       Date().timeIntervalSince(self.lastEditTime) >= 2.0 {
+                        self.text = todayText
+                        self.lastSavedText = todayText
+                    }
                 }
             }
-            let prevCarry = _gsdSerialize(carry)
-            todayText = mergeNotes(todayText, prevCarry)
         }
+    }
 
-        try? todayText.write(to: todayPath, atomically: true, encoding: .utf8)
-        UserDefaults.standard.set(todayKey, forKey: trackerKey)
-
-        // Push the carried-forward state to Firebase so the other Mac sees it too
-        FirebaseDB.write(notebook: currentNotebook, dateKey: todayKey, content: todayText)
-
-        // If we're currently viewing today, refresh the editor
-        if Self.calendar.isDate(currentDate, inSameDayAs: today) {
-            text = todayText
-            lastSavedText = todayText
+    /// Walk back day by day (up to 10) fetching each date from Firebase,
+    /// returning the first one that contains actual tasks. completion's second
+    /// argument is false when a network error interrupted the walk — in that
+    /// case the caller must NOT conclude "no history" and should retry later.
+    private func fetchMostRecentRemoteDay(
+        before today: Date, back: Int,
+        completion: @escaping (String?, Bool) -> Void
+    ) {
+        guard back <= 10,
+              let d = Self.calendar.date(byAdding: .day, value: -back, to: today) else {
+            completion(nil, true)
+            return
+        }
+        let key = Self.fileFormatter.string(from: d)
+        FirebaseDB.fetch(notebook: "Daily", dateKey: key) { [weak self] remote, ok in
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                guard ok else { completion(nil, false); return }
+                if let remote = remote, _gsdHasTasks(remote) {
+                    completion(remote, true)
+                } else {
+                    self.fetchMostRecentRemoteDay(before: today, back: back + 1, completion: completion)
+                }
+            }
         }
     }
 
@@ -1990,6 +2060,12 @@ private func _gsdSerialize(_ sections: [String: [String]]) -> String {
         output += "\n"
     }
     return output
+}
+
+/// True when the note contains at least one real checkbox task — a bare
+/// template ("## Ayush / ### No Sleep / ...") does NOT count as content.
+func _gsdHasTasks(_ text: String) -> Bool {
+    text.components(separatedBy: "\n").contains { _gsdTaskText($0) != nil }
 }
 
 private func _gsdTaskText(_ line: String) -> String? {
