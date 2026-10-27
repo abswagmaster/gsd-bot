@@ -925,6 +925,10 @@ class NoteStore: ObservableObject {
         // Without this, the second person to open GSD each day would merge
         // THEIR stale yesterday-file into the already-groomed shared list —
         // resurrecting deleted tasks and erasing the first person's edits.
+        // Never launch a second chain while one is running — the poll fires
+        // every 2s and an overlapping late chain could push a version without
+        // the user's just-typed edits.
+        guard !carryForwardInFlight else { return }
         FirebaseDB.getFlag("carryDone/\(todayKey)") { [weak self] alreadyDone, ok in
             DispatchQueue.main.async {
                 guard let self = self, ok, self.currentNotebook == "Daily" else { return }
@@ -933,10 +937,14 @@ class NoteStore: ObservableObject {
                     return
                 }
                 guard UserDefaults.standard.string(forKey: trackerKey) != todayKey else { return }
+                guard !self.carryForwardInFlight else { return }
+                self.carryForwardInFlight = true
                 self.runDailyCarryForward(today: today, todayKey: todayKey, trackerKey: trackerKey)
             }
         }
     }
+
+    private var carryForwardInFlight = false
 
     /// Builds today from REMOTE data only. Local files on a Mac that hasn't
     /// been opened in days are stale — carrying forward from them resurrects
@@ -945,11 +953,16 @@ class NoteStore: ObservableObject {
         // 1. What does the server have for today?
         FirebaseDB.fetch(notebook: "Daily", dateKey: todayKey) { [weak self] remoteToday, ok in
             DispatchQueue.main.async {
-                guard let self = self, ok, self.currentNotebook == "Daily" else { return }
+                guard let self = self else { return }
+                guard ok, self.currentNotebook == "Daily" else {
+                    self.carryForwardInFlight = false
+                    return
+                }
 
                 // Day already has real tasks (not just a template) → someone
                 // already started it. Adopt it, mark done, never rewrite.
                 if let remoteToday = remoteToday, _gsdHasTasks(remoteToday) {
+                    self.carryForwardInFlight = false
                     FirebaseDB.setFlag("carryDone/\(todayKey)")
                     UserDefaults.standard.set(todayKey, forKey: trackerKey)
                     try? remoteToday.write(to: self.filePath(for: today), atomically: true, encoding: .utf8)
@@ -964,6 +977,7 @@ class NoteStore: ObservableObject {
 
                 // 2. Fetch the most recent previous day FROM THE SERVER.
                 self.fetchMostRecentRemoteDay(before: today, back: 1) { prevText, walkOK in
+                    defer { self.carryForwardInFlight = false }
                     guard walkOK, self.currentNotebook == "Daily" else { return }
 
                     var todayText = remoteToday ?? self.generateCarryForward(for: today)
