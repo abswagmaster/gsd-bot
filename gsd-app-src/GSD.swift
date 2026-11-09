@@ -891,12 +891,20 @@ class NoteStore: ObservableObject {
 
             ### Best Effort
 
+            ## Eleanora
+
+            ### No Sleep
+
+            ### Best Effort
+
             """
         case "Weekly goals":
             return """
             Ayush:
 
             Rohit:
+
+            Eleanora:
 
             """
         default:
@@ -1985,11 +1993,12 @@ private func storageText(from display: String) -> String {
 private let _gsdSectionOrder = [
     "Ayush/No Sleep", "Ayush/Best Effort",
     "Rohit/No Sleep", "Rohit/Best Effort",
+    "Eleanora/No Sleep", "Eleanora/Best Effort",
 ]
 
 // MARK: - Weekly goals notebook (## Ayush / ## Rohit, no sub-sections)
 
-private let _gsdWeeklySectionOrder = ["Ayush", "Rohit"]
+private let _gsdWeeklySectionOrder = ["Ayush", "Rohit", "Eleanora"]
 
 private func _gsdParseWeeklySections(_ text: String) -> [String: [String]] {
     var result: [String: [String]] = [:]
@@ -1998,6 +2007,7 @@ private func _gsdParseWeeklySections(_ text: String) -> [String: [String]] {
         let t = line.trimmingCharacters(in: .whitespaces)
         if t == "## Ayush" { key = "Ayush"; result[key] = []; continue }
         if t == "## Rohit" { key = "Rohit"; result[key] = []; continue }
+        if t == "## Eleanora" { key = "Eleanora"; result[key] = []; continue }
         if t.hasPrefix("## ") { key = ""; continue }
         if !key.isEmpty { result[key, default: []].append(line) }
     }
@@ -2050,6 +2060,7 @@ private func _gsdParseSections(_ text: String) -> [String: [String]] {
         let t = line.trimmingCharacters(in: .whitespaces)
         if t == "## Ayush" { person = "Ayush"; key = ""; continue }
         if t == "## Rohit" { person = "Rohit"; key = ""; continue }
+        if t == "## Eleanora" { person = "Eleanora"; key = ""; continue }
         if t == "### No Sleep" { key = person + "/No Sleep"; result[key] = []; continue }
         if t == "### Best Effort" { key = person + "/Best Effort"; result[key] = []; continue }
         if t == "#### Weekly goal" { key = person + "/Weekly goal"; result[key] = []; continue }
