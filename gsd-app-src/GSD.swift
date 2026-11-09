@@ -78,7 +78,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// Report which build this Mac is running so sync bugs can be diagnosed:
     ///   curl .../clients.json  →  {"abswag": {...}, "rohitrajuladevi": {...}}
     private func reportBuildBeacon() {
-        let buildStamp = "2026-10-27"
+        let buildStamp = "2026-11-09"
         guard let url = URL(string: "\(FirebaseDB.baseURL)/clients/\(NSUserName()).json") else { return }
         var req = URLRequest(url: url)
         req.httpMethod = "PUT"
